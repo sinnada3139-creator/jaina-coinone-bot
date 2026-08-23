@@ -1,0 +1,535 @@
+import os, time, threading, requests, json, html
+from collections import deque
+from urllib.parse import quote_plus
+import xml.etree.ElementTree as ET
+from flask import Flask, jsonify, render_template_string
+
+app = Flask(__name__)
+COINS = {"WLD":{"avg":452.0,"qty":192495},"KAIA":{"avg":35.0,"qty":1131289}}
+URL = "https://api.coinone.co.kr/public/v2/ticker_new/KRW"
+SESSION = requests.Session()
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","").strip()
+TG_OFFSET = 0
+LOCK = threading.RLock()
+
+# 영구 저장 파일 위치
+# Render Persistent Disk를 /var/data 에 마운트하면 재배포/재시작 후에도 유지됩니다.
+STATE_FILE = os.getenv("STATE_FILE", "/var/data/jaina_state.json")
+
+def load_persistent_state():
+    try:
+        if not os.path.exists(STATE_FILE):
+            return
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        with LOCK:
+            for symbol in COINS:
+                if symbol not in saved:
+                    continue
+                st = STATE[symbol]
+                st["peak"] = float(saved[symbol].get("peak", st.get("peak", 0.0)) or 0.0)
+                st["peak_profit_krw"] = float(saved[symbol].get("peak_profit_krw", st.get("peak_profit_krw", 0.0)) or 0.0)
+                st["last_signal"] = str(saved[symbol].get("last_signal", st.get("last_signal", "")) or "")
+                st["last_alert_ts"] = float(saved[symbol].get("last_alert_ts", st.get("last_alert_ts", 0.0)) or 0.0)
+        print("[State] persistent state loaded", STATE_FILE, flush=True)
+    except Exception as e:
+        print("[State] load error", e, flush=True)
+
+def save_persistent_state():
+    try:
+        directory = os.path.dirname(STATE_FILE)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with LOCK:
+            data = {}
+            for symbol in COINS:
+                st = STATE[symbol]
+                data[symbol] = {
+                    "peak": float(st.get("peak", 0.0) or 0.0),
+                    "peak_profit_krw": float(st.get("peak_profit_krw", 0.0) or 0.0),
+                    "last_signal": str(st.get("last_signal", "") or ""),
+                    "last_alert_ts": float(st.get("last_alert_ts", 0.0) or 0.0),
+                    "saved_at": int(time.time()),
+                }
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        print("[State] save error", e, flush=True)
+
+def persistence_loop():
+    while True:
+        save_persistent_state()
+        time.sleep(30)
+
+STATE = {
+    s: {
+        "peak":0.0,
+        "history":deque(maxlen=240),
+        "price":0.0,
+        "signal":"연결 대기",
+        "score":0,
+        "reason":"데이터 축적 중",
+        "last_signal":"",
+        "last_alert_ts":0.0,
+        "peak_profit_krw":0.0,
+        "profit_drawdown_pct":0.0,
+        "protect_action":"대기",
+    } for s in COINS
+}
+
+load_persistent_state()
+
+def safe_float(v, default=0.0):
+    try:
+        x=float(v)
+        if x != x:  # NaN guard
+            return default
+        return x
+    except:
+        return default
+
+def fetch_tickers():
+    r = SESSION.get(
+        URL,
+        params={"additional_data":"false"},
+        headers={"User-Agent":"JainaCoinMonitor/7.1"},
+        timeout=(5,10),
+    )
+    r.raise_for_status()
+    j = r.json()
+    if j.get("result") != "success":
+        raise RuntimeError(str(j))
+    out={}
+    for t in j.get("tickers",[]):
+        s=str(t.get("target_currency","")).upper()
+        if s in COINS or s == "BTC":
+            p=safe_float(t.get("last"))
+            if p>0:
+                out[s] = {
+                    "price":p,
+                    "quote_volume":safe_float(t.get("quote_volume")),
+                    "first":safe_float(t.get("first")),
+                }
+    return out
+
+def pct(a,b):
+    if not a or not b:
+        return 0.0
+    return (a/b-1)*100
+
+def strategy(symbol, tick):
+    now=time.time()
+    p=safe_float(tick.get("price"))
+    qv=safe_float(tick.get("quote_volume"))
+    meta=COINS[symbol]
+
+    with LOCK:
+        st=STATE[symbol]
+        st["price"]=p
+        st["peak"]=max(st["peak"],p) if st["peak"] else p
+        st["history"].append((now,p,qv))
+        hist=list(st["history"])
+
+        p1m=hist[-20][1] if len(hist)>=20 else hist[0][1]
+        p5m=hist[-100][1] if len(hist)>=100 else hist[0][1]
+        ret1=pct(p,p1m)
+        ret5=pct(p,p5m)
+        price_dd=pct(p,st["peak"])
+        gain=pct(p,meta["avg"])
+
+        current_profit=max(0.0,(p-meta["avg"])*meta["qty"])
+        st["peak_profit_krw"]=max(st.get("peak_profit_krw",0.0),current_profit)
+        peak_profit=st["peak_profit_krw"]
+        profit_dd=((current_profit/peak_profit)-1)*100 if peak_profit>0 else 0.0
+        st["profit_drawdown_pct"]=profit_dd
+
+        recent=hist[-20:]
+        previous=hist[-40:-20] if len(hist)>=40 else []
+        recent_avg=sum(x[2] for x in recent)/len(recent) if recent else 0.0
+        prev_avg=sum(x[2] for x in previous)/len(previous) if previous else 0.0
+        vol_ratio=recent_avg/prev_avg if prev_avg>0 else 1.0
+
+        score=0
+        reasons=[]
+
+        if ret1>=2.0:
+            score+=2; reasons.append(f"1분 +{ret1:.1f}%")
+        elif ret1>=1.0:
+            score+=1; reasons.append(f"1분 +{ret1:.1f}%")
+
+        if ret5>=4.0:
+            score+=2; reasons.append(f"5분 +{ret5:.1f}%")
+        elif ret5>=2.0:
+            score+=1; reasons.append(f"5분 +{ret5:.1f}%")
+
+        if vol_ratio>=1.8:
+            score+=2; reasons.append(f"거래량 {vol_ratio:.1f}배")
+        elif vol_ratio>=1.3:
+            score+=1; reasons.append(f"거래량 {vol_ratio:.1f}배")
+
+        if gain>=100:
+            score+=1; reasons.append("1배 목표권")
+        if gain>=200:
+            score+=1; reasons.append("2배 이상")
+        if gain>=300:
+            score+=1; reasons.append("3배 이상")
+
+        protect_action="대기"
+        rebuy_note=""
+
+        # 1) 급등 중 과열: 고점을 맞히려 하지 않고 일부 익절 준비
+        if score>=5 and price_dd>-3:
+            signal="🔴 급등 과열 · 2차 익절 후보"
+            protect_action="보유량의 15~20% 익절 검토"
+            reason=", ".join(reasons[:4]) if reasons else "단기 과열"
+
+        elif score>=3 and price_dd>-3:
+            signal="🟠 급등 강함 · 1차 익절 준비"
+            protect_action="보유량의 10~15% 익절 검토"
+            reason=", ".join(reasons[:4]) if reasons else "상승 강도 증가"
+
+        # 2) 최고 평가수익 반납 감지: 수익 보호
+        elif gain>=15 and peak_profit>0 and profit_dd<=-30:
+            signal="🛑 수익보호 강경 · 3차 익절 검토"
+            protect_action="보유량의 20~25% 추가 익절 검토"
+            reason=f"최고 평가수익 대비 {profit_dd:.1f}% 감소"
+
+        elif gain>=15 and peak_profit>0 and profit_dd<=-20:
+            signal="🔴 수익보호 2차 익절 후보"
+            protect_action="보유량의 15~20% 익절 검토"
+            reason=f"최고 평가수익 대비 {profit_dd:.1f}% 감소"
+
+        elif gain>=15 and peak_profit>0 and profit_dd<=-10:
+            signal="🟠 수익보호 1차 익절 준비"
+            protect_action="보유량의 10~15% 익절 검토"
+            reason=f"최고 평가수익 대비 {profit_dd:.1f}% 감소"
+
+        # 3) 조정 재매수: 익절금이 있을 때만 검토
+        elif price_dd<=-25:
+            signal="🛑 급락 점검 · 재매수 보류"
+            protect_action="추가 매수 보류"
+            rebuy_note="뉴스/시장 급락 원인 확인"
+            reason=f"고점대비 {price_dd:.1f}%"
+
+        elif price_dd<=-18:
+            signal="🔵 3차 재매수 후보"
+            protect_action="익절금의 30% 이내 재매수 검토"
+            rebuy_note="단, 익절금이 있고 급락이 멈추는지 확인"
+            reason=f"고점대비 {price_dd:.1f}%"
+
+        elif price_dd<=-12:
+            signal="🔵 2차 재매수 후보"
+            protect_action="익절금의 30% 이내 재매수 검토"
+            rebuy_note="단, 1분 하락세 완화 여부 확인"
+            reason=f"고점대비 {price_dd:.1f}%"
+
+        elif price_dd<=-7:
+            signal="🔵 1차 재매수 후보"
+            protect_action="익절금의 20% 이내 재매수 검토"
+            rebuy_note="단, 추가 하락 대비 현금 여유 유지"
+            reason=f"고점대비 {price_dd:.1f}%"
+
+        else:
+            signal="⚪ 홀딩 / 관찰"
+            if len(hist)<20:
+                reason=f"데이터 축적 중 {len(hist)}/20"
+            else:
+                reason=", ".join(reasons[:3]) if reasons else "과열 신호 없음"
+
+        st["signal"]=signal
+        st["score"]=score
+        st["reason"]=reason
+        st["protect_action"]=protect_action
+
+        return {
+            "price":p,
+            "peak":st["peak"],
+            "gain_pct":gain,
+            "drawdown_pct":price_dd,
+            "ret1m":ret1,
+            "ret5m":ret5,
+            "vol_ratio":vol_ratio,
+            "signal":signal,
+            "score":score,
+            "reason":reason,
+            "avg":meta["avg"],
+            "qty":meta["qty"],
+            "current_profit_krw":current_profit,
+            "peak_profit_krw":peak_profit,
+            "profit_drawdown_pct":profit_dd,
+            "protect_action":protect_action,
+            "rebuy_note":rebuy_note,
+        }
+
+def tg(method,payload=None):
+    if not TOKEN:
+        return None
+    try:
+        return SESSION.post(
+            f"https://api.telegram.org/bot{TOKEN}/{method}",
+            json=payload or {},
+            timeout=(5,12),
+        ).json()
+    except Exception as e:
+        print("[Telegram]",e,flush=True)
+        return None
+
+def send(text,cid):
+    if cid:
+        tg("sendMessage",{"chat_id":cid,"text":text})
+
+def alert_text(symbol,d):
+    return (
+        f"【자이나 코인봇】 {symbol}/KRW\n"
+        f"현재가 {d['price']:,.4f}원\n"
+        f"평단대비 {d['gain_pct']:+.2f}%\n"
+        f"고점대비 {d['drawdown_pct']:+.2f}%\n"
+        f"1분 {d['ret1m']:+.2f}% / 5분 {d['ret5m']:+.2f}%\n"
+        f"거래량비 {d['vol_ratio']:.2f}배\n"
+        f"현재 평가수익 {d['current_profit_krw']:,.0f}원\n"
+        f"최고 평가수익 {d['peak_profit_krw']:,.0f}원\n"
+        f"최고수익 대비 {d['profit_drawdown_pct']:+.2f}%\n"
+        f"신호 {d['signal']}\n"
+        f"권장행동 {d['protect_action']}\n"
+        f"{('재매수메모 ' + d.get('rebuy_note','') + chr(10)) if d.get('rebuy_note') else ''}"
+        f"이유 {d['reason']}\n\n"
+        f"※ 자동주문 없음 — 코인원 앱에서 직접 판단"
+    )
+
+def monitor_loop():
+    global CHAT_ID
+    last_summary_ts = 0
+    while True:
+        try:
+            ticks=fetch_tickers()
+            for s,tick in ticks.items():
+                if s not in COINS:
+                    continue
+                d=strategy(s,tick)
+                with LOCK:
+                    st=STATE[s]
+                    sig=d["signal"]
+                    now=time.time()
+                    alertable=sig.startswith(("🔴","🟠","🔵","🛑"))
+                    changed=sig!=st["last_signal"]
+                    cooldown=now-st["last_alert_ts"]>=17*60
+                    if alertable and changed and cooldown:
+                        st["last_signal"]=sig
+                        st["last_alert_ts"]=now
+                        if CHAT_ID:
+                            send(alert_text(s,d),CHAT_ID)
+                    elif not alertable:
+                        st["last_signal"]=sig
+            # 17분마다 WLD·KAIA 상태 요약을 텔레그램으로 자동 전송
+            now_summary = time.time()
+            if CHAT_ID and now_summary - last_summary_ts >= 17 * 60:
+                parts = []
+                for coin in COINS:
+                    if coin in ticks:
+                        parts.append(alert_text(coin, strategy(coin, ticks[coin])))
+                if parts:
+                    send("⏰ 17분 자동 상태 요약\n\n" + "\n\n".join(parts), CHAT_ID)
+                    last_summary_ts = now_summary
+
+            print("[Strategy] updated", ",".join(ticks.keys()), flush=True)
+        except Exception as e:
+            print("[Strategy] error",e,flush=True)
+        time.sleep(3)
+
+def snapshot():
+    ticks=fetch_tickers()
+    out={}
+    for s,t in ticks.items():
+        if s not in COINS:
+            continue
+        out[s]=strategy(s,t)
+    return out
+
+
+# ---------- NEWS / MARKET ----------
+NEWS_INTERVAL = 2 * 60 * 60
+LAST_NEWS_SENT = 0.0
+
+POS_WORDS = [
+    "partnership","partner","launch","upgrade","adoption","integration",
+    "approval","funding","growth","expands","surge","rally","listing",
+    "협력","파트너","출시","업그레이드","채택","통합","승인","상장","급등","호재"
+]
+NEG_WORDS = [
+    "hack","exploit","lawsuit","investigation","ban","delist","drop","plunge",
+    "sell-off","outage","fraud","decline","risk",
+    "해킹","소송","조사","금지","상폐","급락","매도","장애","사기","악재","위험"
+]
+
+def google_news_rss(query, limit=4):
+    url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=ko&gl=KR&ceid=KR:ko"
+    r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=(5,12))
+    r.raise_for_status()
+    root = ET.fromstring(r.content)
+    items = []
+    for item in root.findall(".//item")[:limit]:
+        title = html.unescape((item.findtext("title") or "").strip())
+        link = (item.findtext("link") or "").strip()
+        items.append({"title": title, "link": link})
+    return items
+
+def classify_news(title):
+    low = title.lower()
+    pos = sum(1 for w in POS_WORDS if w in low)
+    neg = sum(1 for w in NEG_WORDS if w in low)
+    if pos > neg: return "🟢"
+    if neg > pos: return "🔴"
+    return "⚪"
+
+def market_brief():
+    try:
+        ticks = fetch_tickers()
+        btc = ticks.get("BTC")
+        if not btc:
+            return "BTC 시황 확인 지연"
+        p = btc["price"]
+        first = btc.get("first", 0.0)
+        chg = pct(p, first) if first else 0.0
+        mood = "강세" if chg >= 2 else "약세" if chg <= -2 else "중립"
+        return f"BTC {p:,.0f}원 · 24시간 {chg:+.2f}% · {mood}"
+    except Exception:
+        return "BTC 시황 확인 지연"
+
+def news_digest():
+    sections = [
+        ("🌐 크립토 시황", "cryptocurrency Bitcoin Ethereum market when:1d"),
+        ("🟣 KAIA 뉴스", "KAIA blockchain OR Kaia crypto when:2d"),
+        ("🔵 WLD 뉴스", "Worldcoin OR World Network WLD crypto when:2d"),
+    ]
+    parts = ["📰 【자이나 크립토 뉴스 브리핑】", market_brief(), ""]
+    for section, query in sections:
+        parts.append(section)
+        try:
+            items = google_news_rss(query, 4)
+            if not items:
+                parts.append("새 주요 기사 없음")
+            for i, it in enumerate(items, 1):
+                parts.append(f"{classify_news(it['title'])} {i}. {it['title']}\n{it['link']}")
+        except Exception as e:
+            parts.append(f"뉴스 조회 지연 ({type(e).__name__})")
+        parts.append("")
+    parts.append("🟢 긍정 가능성 · 🔴 부정 가능성 · ⚪ 중립/판단보류")
+    parts.append("※ 제목 키워드 기반 분류이며 투자 판단을 보장하지 않습니다.")
+    return "\n".join(parts)
+
+def auto_news_loop():
+    global LAST_NEWS_SENT
+    while True:
+        try:
+            if CHAT_ID and time.time() - LAST_NEWS_SENT >= NEWS_INTERVAL:
+                send(news_digest(), CHAT_ID)
+                LAST_NEWS_SENT = time.time()
+                print("[News] digest sent", flush=True)
+        except Exception as e:
+            print("[News] error", e, flush=True)
+        time.sleep(60)
+# ---------- END NEWS ----------
+
+def telegram_loop():
+    global TG_OFFSET, CHAT_ID
+    if not TOKEN:
+        return
+    while True:
+        r=tg("getUpdates",{"offset":TG_OFFSET,"timeout":5,"allowed_updates":["message"]})
+        if not r or not r.get("ok"):
+            time.sleep(3)
+            continue
+        for u in r.get("result",[]):
+            TG_OFFSET=max(TG_OFFSET,int(u.get("update_id",0))+1)
+            msg=u.get("message") or {}
+            cid=str((msg.get("chat") or {}).get("id") or "")
+            text=(msg.get("text") or "").strip()
+            if not cid:
+                continue
+            if not CHAT_ID:
+                CHAT_ID=cid
+            if text.startswith("/start") or text.lower()=="start":
+                send("✅ Jaina Coin Monitor v9 연결 완료\n/status 현재상태\n/news 최신 크립토·KAIA·WLD 뉴스\n/market BTC 시장요약\n/test 알림테스트\n\n뉴스 브리핑은 2시간마다 자동 발송\n※ 자동주문 없음",cid)
+            elif text.startswith("/test"):
+                send("🔔 테스트 알림 성공",cid)
+            elif text.startswith("/status"):
+                try:
+                    d=snapshot()
+                    parts=[alert_text(s,d[s]) for s in ("WLD","KAIA") if s in d]
+                    send("\n\n".join(parts),cid)
+                except Exception as e:
+                    send(f"⚠️ 시세 조회 오류: {e}",cid)
+            elif text.startswith("/news"):
+                send("📰 최신 뉴스를 수집하고 있습니다. 잠시만 기다려 주세요.",cid)
+                try:
+                    send(news_digest(),cid)
+                except Exception as e:
+                    send(f"⚠️ 뉴스 조회 오류: {e}",cid)
+            elif text.startswith("/market"):
+                send("📊 " + market_brief(),cid)
+
+HTML = '''
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>자이나 코인원 감시봇</title>
+<style>
+body{font-family:system-ui;background:#f4f6f8;margin:0;padding:15px;color:#101828}
+.w{max-width:680px;margin:auto}.c{background:#fff;border-radius:18px;padding:18px;margin:12px 0}
+.p{font-size:30px;font-weight:800}.s{background:#eef2f7;border-radius:11px;padding:12px;margin-top:12px;font-weight:800}
+.ok{color:#067647}small{color:#667085;line-height:1.5}
+</style>
+<div class="w"><h2>자이나 코인원 감시봇 v9</h2><small>WLD · KAIA / 전략 신호 + 뉴스 / 자동주문 없음</small><div id="x"></div></div>
+<script>
+function n(v,d=0){const x=Number(v);return Number.isFinite(x)?x:d}
+async function g(){
+ try{
+  const r=await fetch("/api?x="+Date.now(),{cache:"no-store"});
+  const d=await r.json();
+  x.innerHTML=Object.entries(d).map(([s,c])=>{
+    const p=n(c.price), avg=n(c.avg), peak=n(c.peak), gp=n(c.gain_pct), dd=n(c.drawdown_pct), r1=n(c.ret1m), r5=n(c.ret5m), vr=n(c.vol_ratio,1);
+    const reason=(c.reason===undefined||c.reason===null||c.reason==="")?"데이터 축적 중":c.reason;
+    const sig=(c.signal===undefined||c.signal===null||c.signal==="")?"⚪ 홀딩 / 관찰":c.signal;
+    return `<div class="c">
+      <b>${s}/KRW</b>
+      <div class="p">${p.toLocaleString()}원</div>
+      <div class="ok">🟢 코인원 연결</div>
+      <small>평단 ${avg.toLocaleString()}원 · 평단대비 ${gp.toFixed(2)}%<br>
+      최근고점 ${peak.toLocaleString()}원 · 고점대비 ${dd.toFixed(2)}%<br>
+      1분 ${r1.toFixed(2)}% · 5분 ${r5.toFixed(2)}% · 거래량비 ${vr.toFixed(2)}배<br>
+      현재 평가수익 ${Number(c.current_profit_krw||0).toLocaleString()}원<br>
+      최고 평가수익 ${Number(c.peak_profit_krw||0).toLocaleString()}원 · 최고수익 대비 ${Number(c.profit_drawdown_pct||0).toFixed(2)}%<br>
+      권장행동: ${c.protect_action||"대기"}<br>
+      ${c.rebuy_note?`재매수메모: ${c.rebuy_note}<br>`:""}
+      이유: ${reason}</small>
+      <div class="s">${sig}</div>
+    </div>`;
+  }).join("")
+ }catch(e){
+   x.innerHTML="<div class='c'>⚠️ 시세 조회 오류</div>"
+ }
+}
+setInterval(g,3000);g()
+</script>
+'''
+
+@app.route("/")
+def home(): return render_template_string(HTML)
+
+@app.route("/api")
+def api():
+    try: return jsonify(snapshot())
+    except Exception as e: return jsonify({"error":str(e)}),500
+
+@app.route("/health")
+def health(): return "OK",200
+
+threading.Thread(target=monitor_loop,daemon=True).start()
+threading.Thread(target=telegram_loop,daemon=True).start()
+threading.Thread(target=persistence_loop,daemon=True).start()
+threading.Thread(target=auto_news_loop,daemon=True).start()
+
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")))
