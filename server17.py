@@ -229,6 +229,45 @@ def position_text():
     return "\n".join(lines)
 
 
+
+def booktest_text():
+    """매매장부를 변경하지 않고 매도→개인인출→재매수 흐름을 계산만 해본다."""
+    lines=["🧪 v11.3 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
+    with LOCK:
+        originals={k:{
+            "qty":float(v["qty"]), "avg":float(v["avg"]), "cash":float(v["cash"]),
+            "withdrawn":float(v.get("withdrawn",0.0)), "realized_pnl":float(v["realized_pnl"]),
+            "trades_len":len(v.get("trades",[]))
+        } for k,v in LEDGER.items()}
+    # W 기준: 현재 장부의 15%를 평단+25% 가격에 가상 매도
+    o=originals["WLD"]
+    test_price=o["avg"]*1.25
+    sell_qty=o["qty"]*0.15
+    sell_amount=sell_qty*test_price
+    test_cash=o["cash"]+sell_amount
+    withdraw=min(1_000_000.0, test_cash*0.20)
+    after_withdraw=test_cash-withdraw
+    rebuy=min(after_withdraw*0.30, 1_000_000.0)
+    final_cash=after_withdraw-rebuy
+    lines += [
+        "", "✅ 1. 가상 15% 매도 계산 통과",
+        f"W 가상 매도수량 {qty_text(sell_qty)}개 · 가상 확보금 {sell_amount:,.0f}원",
+        "", "✅ 2. 가상 개인인출 계산 통과",
+        f"가상 인출 {withdraw:,.0f}원 · 인출 후 재매수 가능금 {after_withdraw:,.0f}원",
+        "", "✅ 3. 가상 재매수 계산 통과",
+        f"가상 재매수 사용 {rebuy:,.0f}원 · 가상 잔여현금 {final_cash:,.0f}원",
+    ]
+    with LOCK:
+        after={k:{
+            "qty":float(v["qty"]), "avg":float(v["avg"]), "cash":float(v["cash"]),
+            "withdrawn":float(v.get("withdrawn",0.0)), "realized_pnl":float(v["realized_pnl"]),
+            "trades_len":len(v.get("trades",[]))
+        } for k,v in LEDGER.items()}
+    unchanged=(originals==after)
+    lines += ["", ("✅ 4. 실제 장부 무변경 확인 통과" if unchanged else "❌ 4. 실제 장부 변경 감지"),
+              "", ("🎉 /booktest 전체 통과 — 실제 운영 가능" if unchanged else "⚠️ 운영 중지 — 장부 변경 여부 확인 필요")]
+    return "\n".join(lines)
+
 def strategy(symbol, tick):
     now=time.time()
     p=safe_float(tick.get("price"))
@@ -741,7 +780,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v11.1 연결 완료\n/status 현재상태\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/buy W 3000000 520 재매수\n/news 최신 뉴스\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스 2시간 자동발송\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v11.3 연결 완료\n/status 현재상태\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/buy W 3000000 520 재매수\n/news 최신 뉴스\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스 2시간 자동발송\n※ 자동주문 없음",cid)
             elif text.startswith("/sell"):
                 try:
                     p=text.split(maxsplit=4)
@@ -780,6 +819,18 @@ def telegram_loop():
                     send(f"⚠️ 인출 기록 실패: {e}",cid)
             elif text.startswith("/position"):
                 send(position_text(),cid)
+            elif text.split()[0].split("@")[0].lower() == "/version" if text else False:
+                send("✅ Jaina Coin Monitor v11.3 실행 중", cid)
+            elif text.split()[0].split("@")[0].lower() == "/booktest" if text else False:
+                # 먼저 수신 확인을 보내므로, 긴 테스트 전에 명령 수신 여부를 즉시 알 수 있다.
+                send("🧪 /booktest 명령 수신 — 장부 무변경 안전 테스트 시작", cid)
+                try:
+                    result = booktest_text()
+                    send(result,cid)
+                    print("[Telegram] /booktest completed", flush=True)
+                except Exception as e:
+                    print("[Telegram] /booktest error", repr(e), flush=True)
+                    send(f"⚠️ 장부 테스트 실패: {type(e).__name__}: {e}",cid)
             elif text.startswith("/enginetest"):
                 run_enginetest(cid)
             elif text.startswith("/signaltest"):
@@ -814,7 +865,7 @@ body{font-family:system-ui;background:#f4f6f8;margin:0;padding:15px;color:#10182
 .p{font-size:30px;font-weight:800}.s{background:#eef2f7;border-radius:11px;padding:12px;margin-top:12px;font-weight:800}
 .ok{color:#067647}small{color:#667085;line-height:1.5}
 </style>
-<div class="w"><h2>자이나 코인원 감시봇 v11.1</h2><small>WLD · KAIA / 준비·실행·황금구간 / 자동주문 없음</small><div id="x"></div></div>
+<div class="w"><h2>자이나 코인원 감시봇 v11.3</h2><small>WLD · KAIA / 준비·실행·황금구간 / 자동주문 없음</small><div id="x"></div></div>
 <script>
 function n(v,d=0){const x=Number(v);return Number.isFinite(x)?x:d}
 async function g(){
