@@ -17,7 +17,7 @@ LOCK = threading.RLock()
 SYMBOL_ALIAS = {"W":"WLD","K":"KAIA","WLD":"WLD","KAIA":"KAIA"}
 LEDGER = {s:{
     "qty":float(COINS[s]["qty"]), "avg":float(COINS[s]["avg"]),
-    "cash":0.0, "withdrawn":0.0, "realized_pnl":0.0, "trades":[]
+    "cash":0.0, "withdrawn":0.0, "deposited":0.0, "realized_pnl":0.0, "trades":[]
 } for s in COINS}
 
 # 영구 저장 파일 위치
@@ -43,6 +43,7 @@ def load_persistent_state():
                     LEDGER[symbol]["avg"]=float(x.get("avg",LEDGER[symbol]["avg"]) or 0)
                     LEDGER[symbol]["cash"]=float(x.get("cash",0) or 0)
                     LEDGER[symbol]["withdrawn"]=float(x.get("withdrawn",0) or 0)
+                    LEDGER[symbol]["deposited"]=float(x.get("deposited",0) or 0)
                     LEDGER[symbol]["realized_pnl"]=float(x.get("realized_pnl",0) or 0)
                     LEDGER[symbol]["trades"]=list(x.get("trades",[]) or [])[-100:]
                     COINS[symbol]["qty"]=LEDGER[symbol]["qty"]
@@ -70,6 +71,7 @@ def save_persistent_state():
                 "qty":float(LEDGER[s]["qty"]), "avg":float(LEDGER[s]["avg"]),
                 "cash":float(LEDGER[s]["cash"]),
                 "withdrawn":float(LEDGER[s].get("withdrawn",0.0)),
+                "deposited":float(LEDGER[s].get("deposited",0.0)),
                 "realized_pnl":float(LEDGER[s]["realized_pnl"]),
                 "trades":list(LEDGER[s]["trades"])[-100:]
             } for s in COINS}
@@ -188,6 +190,19 @@ def record_buy(symbol, amount, price, reason=""):
         return symbol,q,nq,na,l["cash"]
 
 
+def record_deposit(symbol, amount, reason=""):
+    symbol=normalize_symbol(symbol); amount=safe_float(amount)
+    if not symbol: raise ValueError("코인은 W 또는 K로 입력하세요.")
+    if amount<=0: raise ValueError("입금금액은 0보다 커야 합니다.")
+    with LOCK:
+        l=LEDGER[symbol]
+        l["cash"]+=amount
+        l["deposited"]=float(l.get("deposited",0.0))+amount
+        l["trades"].append({"ts":int(time.time()),"side":"DEPOSIT","qty":0.0,"price":0.0,"amount":amount,"reason":reason or ""})
+        save_persistent_state()
+        return symbol,amount,l["cash"],l["deposited"]
+
+
 def record_withdraw(symbol, amount, reason=""):
     symbol=normalize_symbol(symbol)
     amount=safe_float(amount)
@@ -223,6 +238,7 @@ def position_text():
             lines += [f"\n{short}",f"보유수량 {qty_text(l['qty'])}개",
                       f"장부평단 {l['avg']:,.4f}원",
                       f"재매수 가능 현금 {l['cash']:,.0f}원",
+                      f"외부입금 누적 {float(l.get('deposited',0.0)):,.0f}원",
                       f"개인인출 누적 {float(l.get('withdrawn',0.0)):,.0f}원",
                       f"누적 실현손익 {l['realized_pnl']:+,.0f}원"]
     lines.append("\n※ 수수료 제외 · 사용자가 입력한 실제 체결만 반영")
@@ -232,7 +248,7 @@ def position_text():
 
 def booktest_text():
     """매매장부를 변경하지 않고 매도→개인인출→재매수 흐름을 계산만 해본다."""
-    lines=["🧪 v11.3 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
+    lines=["🧪 v11.4 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
     with LOCK:
         originals={k:{
             "qty":float(v["qty"]), "avg":float(v["avg"]), "cash":float(v["cash"]),
@@ -780,7 +796,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v11.3 연결 완료\n/status 현재상태\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/buy W 3000000 520 재매수\n/news 최신 뉴스\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스 2시간 자동발송\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v11.4 연결 완료\n/status 현재상태\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/buy W 3000000 520 재매수\n/news 최신 뉴스\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스 2시간 자동발송\n※ 자동주문 없음",cid)
             elif text.startswith("/sell"):
                 try:
                     p=text.split(maxsplit=4)
@@ -799,11 +815,20 @@ def telegram_loop():
                     short="W" if s=="WLD" else "K"
                     send(f"✅ {short} 재매수 기록 완료\n매수수량 {qty_text(q)}개\n새 보유수량 {qty_text(nq)}개\n새 장부평단 {na:,.4f}원\n남은 재매수 현금 {cash:,.0f}원",cid)
                 except Exception as e: send(f"⚠️ 재매수 기록 실패: {e}",cid)
+            elif text.startswith("/deposit"):
+                try:
+                    p=text.split(maxsplit=3)
+                    if len(p)<3: raise ValueError("사용법: /deposit W 3000000 추가투자금")
+                    reason=p[3] if len(p)>3 else ""
+                    s,amount,cash,deposited=record_deposit(p[1],p[2],reason)
+                    short="W" if s=="WLD" else "K"
+                    send(f"✅ {short} 외부입금 기록 완료\\n입금금액 {amount:,.0f}원\\n재매수 가능 현금 {cash:,.0f}원\\n외부입금 누적 {deposited:,.0f}원",cid)
+                except Exception as e: send(f"⚠️ 입금 기록 실패: {e}",cid)
             elif text.startswith("/withdraw"):
                 try:
                     p=text.split(maxsplit=3)
                     if len(p)<3:
-                        raise ValueError("사용법: /withdraw W 1000000 생활비")
+                        raise ValueError("사용법: /deposit W 3000000 추가투자금\n/withdraw W 1000000 생활비")
                     reason=p[3] if len(p)>3 else ""
                     r=record_withdraw(p[1],p[2],reason)
                     short="W" if r["symbol"]=="WLD" else "K"
@@ -820,7 +845,7 @@ def telegram_loop():
             elif text.startswith("/position"):
                 send(position_text(),cid)
             elif text.split()[0].split("@")[0].lower() == "/version" if text else False:
-                send("✅ Jaina Coin Monitor v11.3 실행 중", cid)
+                send("✅ Jaina Coin Monitor v11.4 실행 중", cid)
             elif text.split()[0].split("@")[0].lower() == "/booktest" if text else False:
                 # 먼저 수신 확인을 보내므로, 긴 테스트 전에 명령 수신 여부를 즉시 알 수 있다.
                 send("🧪 /booktest 명령 수신 — 장부 무변경 안전 테스트 시작", cid)
@@ -865,7 +890,7 @@ body{font-family:system-ui;background:#f4f6f8;margin:0;padding:15px;color:#10182
 .p{font-size:30px;font-weight:800}.s{background:#eef2f7;border-radius:11px;padding:12px;margin-top:12px;font-weight:800}
 .ok{color:#067647}small{color:#667085;line-height:1.5}
 </style>
-<div class="w"><h2>자이나 코인원 감시봇 v11.3</h2><small>WLD · KAIA / 준비·실행·황금구간 / 자동주문 없음</small><div id="x"></div></div>
+<div class="w"><h2>자이나 코인원 감시봇 v11.4</h2><small>WLD · KAIA / 준비·실행·황금구간 / 자동주문 없음</small><div id="x"></div></div>
 <script>
 function n(v,d=0){const x=Number(v);return Number.isFinite(x)?x:d}
 async function g(){
