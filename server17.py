@@ -174,6 +174,37 @@ def record_sell(symbol, percent, price, reason=""):
         save_persistent_state()
         return symbol,q,amount,pnl,l["qty"],l["cash"]
 
+
+def record_sell_qty(symbol, qty, price, reason=""):
+    symbol=normalize_symbol(symbol)
+    qty=safe_float(qty)
+    price=safe_float(price)
+    if not symbol:
+        raise ValueError("코인은 W 또는 K로 입력하세요.")
+    if qty<=0 or price<=0:
+        raise ValueError("매도수량/가격을 확인하세요.")
+    with LOCK:
+        l=LEDGER[symbol]
+        before=float(l["qty"])
+        if before<=0:
+            raise ValueError("기록된 보유수량이 없습니다.")
+        if qty > before + 1e-8:
+            raise ValueError(f"매도수량이 장부 보유수량보다 많습니다. 현재 {qty_text(before)}개")
+        amount=qty*price
+        pnl=(price-float(l["avg"]))*qty
+        l["qty"]=max(0.0,before-qty)
+        l["cash"]+=amount
+        l["realized_pnl"]+=pnl
+        l["trades"].append({
+            "ts":int(time.time()),"side":"SELL_QTY","qty":qty,
+            "price":price,"amount":amount,"reason":reason or ""
+        })
+        COINS[symbol]["qty"]=l["qty"]
+        COINS[symbol]["avg"]=l["avg"]
+        save_persistent_state()
+        return symbol,qty,amount,pnl,l["qty"],l["cash"]
+
+
 def record_buy(symbol, amount, price, reason=""):
     symbol=normalize_symbol(symbol); amount=safe_float(amount); price=safe_float(price)
     if not symbol: raise ValueError("코인은 W 또는 K로 입력하세요.")
@@ -248,7 +279,7 @@ def position_text():
 
 def booktest_text():
     """매매장부를 변경하지 않고 매도→개인인출→재매수 흐름을 계산만 해본다."""
-    lines=["🧪 v11.4 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
+    lines=["🧪 v11.5 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
     with LOCK:
         originals={k:{
             "qty":float(v["qty"]), "avg":float(v["avg"]), "cash":float(v["cash"]),
@@ -796,11 +827,32 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v11.4 연결 완료\n/status 현재상태\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/buy W 3000000 520 재매수\n/news 최신 뉴스\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스 2시간 자동발송\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v11.5 연결 완료\n/status 현재상태\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/news 최신 뉴스\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스 2시간 자동발송\n※ 자동주문 없음",cid)
+            elif text.startswith("/sellqty"):
+                try:
+                    p=text.split(maxsplit=4)
+                    if len(p)<4:
+                        raise ValueError("사용법: /sellqty W 12173.91304347 552 실제체결")
+                    reason=p[4] if len(p)>4 else ""
+                    s,q,amount,pnl,remain,cash=record_sell_qty(p[1],p[2],p[3],reason)
+                    short="W" if s=="WLD" else "K"
+                    send(
+                        f"✅ {short} 실제수량 매도 기록 완료\n"
+                        f"매도수량 {qty_text(q)}개\n"
+                        f"체결가 {float(p[3]):,.4f}원\n"
+                        f"장부 확보금액 {amount:,.0f}원\n"
+                        f"이번 실현손익 {pnl:+,.0f}원\n"
+                        f"남은수량 {qty_text(remain)}개\n"
+                        f"재매수 가능 현금 {cash:,.0f}원\n"
+                        f"※ 거래소 수수료는 별도 반영되지 않음",
+                        cid
+                    )
+                except Exception as e:
+                    send(f"⚠️ 실제수량 매도 기록 실패: {e}",cid)
             elif text.startswith("/sell"):
                 try:
                     p=text.split(maxsplit=4)
-                    if len(p)<4: raise ValueError("사용법: /sell W 15 559 급등익절")
+                    if len(p)<4: raise ValueError("사용법: /sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결")
                     reason=p[4] if len(p)>4 else ""
                     s,q,amount,pnl,remain,cash=record_sell(p[1],p[2],p[3],reason)
                     short="W" if s=="WLD" else "K"
@@ -845,7 +897,7 @@ def telegram_loop():
             elif text.startswith("/position"):
                 send(position_text(),cid)
             elif text.split()[0].split("@")[0].lower() == "/version" if text else False:
-                send("✅ Jaina Coin Monitor v11.4 실행 중", cid)
+                send("✅ Jaina Coin Monitor v11.5 실행 중", cid)
             elif text.split()[0].split("@")[0].lower() == "/booktest" if text else False:
                 # 먼저 수신 확인을 보내므로, 긴 테스트 전에 명령 수신 여부를 즉시 알 수 있다.
                 send("🧪 /booktest 명령 수신 — 장부 무변경 안전 테스트 시작", cid)
@@ -890,7 +942,7 @@ body{font-family:system-ui;background:#f4f6f8;margin:0;padding:15px;color:#10182
 .p{font-size:30px;font-weight:800}.s{background:#eef2f7;border-radius:11px;padding:12px;margin-top:12px;font-weight:800}
 .ok{color:#067647}small{color:#667085;line-height:1.5}
 </style>
-<div class="w"><h2>자이나 코인원 감시봇 v11.4</h2><small>WLD · KAIA / 준비·실행·황금구간 / 자동주문 없음</small><div id="x"></div></div>
+<div class="w"><h2>자이나 코인원 감시봇 v11.5</h2><small>WLD · KAIA / 준비·실행·황금구간 / 자동주문 없음</small><div id="x"></div></div>
 <script>
 function n(v,d=0){const x=Number(v);return Number.isFinite(x)?x:d}
 async function g(){
