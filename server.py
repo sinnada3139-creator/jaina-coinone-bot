@@ -299,7 +299,7 @@ def position_text():
 
 def booktest_text():
     """매매장부를 변경하지 않고 매도→개인인출→재매수 흐름을 계산만 해본다."""
-    lines=["🧪 v11.7 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
+    lines=["🧪 v11.8 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
     with LOCK:
         originals={k:{
             "qty":float(v["qty"]), "avg":float(v["avg"]), "cash":float(v["cash"]),
@@ -335,7 +335,7 @@ def booktest_text():
               "", ("🎉 /booktest 전체 통과 — 실제 운영 가능" if unchanged else "⚠️ 운영 중지 — 장부 변경 여부 확인 필요")]
     return "\n".join(lines)
 
-# v11.7 trend filter: Coinone public candle data only (no account API / no auto-order)
+# v11.8 trend filter: Coinone public candle data only (no account API / no auto-order)
 TREND_CACHE = {}
 TREND_CACHE_TTL = 60
 
@@ -417,6 +417,50 @@ def trend_analysis(symbol):
     except Exception as e:
         data={"ready":False,"score":0,"label":"⚪ 추세 데이터 확인중","error":str(e)}
     TREND_CACHE[symbol]={"ts":now,"data":data}; return data
+
+
+def trend_report_text():
+    """현재 WLD/KAIA의 단기·중기 추세와 매도 판단 보조를 한눈에 보여준다."""
+    parts=["📈 【자이나 추세판단】"]
+    for symbol in ("WLD","KAIA"):
+        t=trend_analysis(symbol)
+        short_name="W" if symbol=="WLD" else "K"
+        if not t.get("ready"):
+            parts.append(
+                f"\n{short_name} ({symbol})\n"
+                f"⚪ 추세 데이터 확인중\n"
+                f"이유 {t.get('error','캔들 데이터 부족')}"
+            )
+            continue
+
+        s=t["short"]; m=t["mid"]; score=int(t.get("score",0))
+        if score>=75:
+            final="🟢 상승추세 강함 — 보호매도 신호가 와도 전량매도보다 관찰/소량 분할 우선"
+        elif score>=60:
+            final="🟢 상승추세 유지 — 매도는 서두르지 말고 추세 약화 동반 여부 확인"
+        elif score>=45:
+            final="🟡 추세 둔화/혼조 — 보호매도 신호와 함께 오면 분할익절 비중 확대 검토"
+        else:
+            final="🔴 추세 훼손 주의 — 보호매도 신호와 겹치면 수익보호 우선순위 상승"
+
+        parts.append(
+            f"\n{short_name} ({symbol})\n"
+            f"추세신뢰도 {score}/100 · {t.get('label','')}\n"
+            f"단기 15분봉: EMA20/60 {'🟢' if s.get('ema_bull') else '🔴'} · "
+            f"EMA20기울기 {s.get('slope',0):+.2f}% · RSI {s.get('rsi',50):.1f} · "
+            f"MACD {'🟢' if s.get('macd_bull') else '🔴'} · "
+            f"저점상승 {'🟢' if s.get('hl') else '🔴'}\n"
+            f"중기 4시간봉: EMA20/60 {'🟢' if m.get('ema_bull') else '🔴'} · "
+            f"EMA20기울기 {m.get('slope',0):+.2f}% · RSI {m.get('rsi',50):.1f} · "
+            f"MACD {'🟢' if m.get('macd_bull') else '🔴'} · "
+            f"저점상승 {'🟢' if m.get('hl') else '🔴'}\n"
+            f"최종보조판단 {final}"
+        )
+
+    parts.append(
+        "\n※ 추세지표는 매도 여부의 최종 보조판단용이며 자동주문은 하지 않습니다."
+    )
+    return "\n".join(parts)
 
 def strategy(symbol, tick):
     now=time.time()
@@ -955,7 +999,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v11.6 연결 완료\n/status 현재상태\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스 2시간 자동발송\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v11.6 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스 2시간 자동발송\n※ 자동주문 없음",cid)
             elif text.startswith("/sellqty"):
                 try:
                     p=text.split(maxsplit=4)
@@ -1042,8 +1086,15 @@ def telegram_loop():
                     send(f"⚠️ 인출 기록 실패: {e}",cid)
             elif text.startswith("/position"):
                 send(position_text(),cid)
+            elif text.split()[0].split("@")[0].lower() == "/trend" if text else False:
+                send("📈 단기·중기 추세를 계산하고 있습니다.", cid)
+                try:
+                    send(trend_report_text(), cid)
+                except Exception as e:
+                    print("[Telegram] /trend error", repr(e), flush=True)
+                    send(f"⚠️ 추세 조회 오류: {type(e).__name__}: {e}", cid)
             elif text.split()[0].split("@")[0].lower() == "/version" if text else False:
-                send("✅ Jaina Coin Monitor v11.7 실행 중", cid)
+                send("✅ Jaina Coin Monitor v11.8 실행 중", cid)
             elif text.split()[0].split("@")[0].lower() == "/booktest" if text else False:
                 # 먼저 수신 확인을 보내므로, 긴 테스트 전에 명령 수신 여부를 즉시 알 수 있다.
                 send("🧪 /booktest 명령 수신 — 장부 무변경 안전 테스트 시작", cid)
