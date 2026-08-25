@@ -261,6 +261,26 @@ def record_withdraw(symbol, amount, reason=""):
         }
 
 
+
+def record_cashset(symbol, amount, reason=""):
+    """재매수 가능 현금만 실제 거래소 잔액에 맞춰 정정한다. 인출/입금/실현손익 누계는 건드리지 않는다."""
+    symbol=normalize_symbol(symbol)
+    amount=safe_float(amount)
+    if not symbol:
+        raise ValueError("코인은 W 또는 K로 입력하세요.")
+    if amount < 0:
+        raise ValueError("현금 잔액은 0원 이상이어야 합니다.")
+    with LOCK:
+        l=LEDGER[symbol]
+        before=float(l.get("cash",0.0))
+        l["cash"]=amount
+        l["trades"].append({
+            "ts":int(time.time()),"side":"CASHSET","qty":0.0,"price":0.0,
+            "amount":amount,"before_cash":before,"reason":reason or ""
+        })
+        save_persistent_state()
+        return {"symbol":symbol,"before":before,"cash":amount,"reason":reason or ""}
+
 def position_text():
     lines=["📒 【자이나 매매장부】"]
     with LOCK:
@@ -279,7 +299,7 @@ def position_text():
 
 def booktest_text():
     """매매장부를 변경하지 않고 매도→개인인출→재매수 흐름을 계산만 해본다."""
-    lines=["🧪 v11.5 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
+    lines=["🧪 v11.6 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
     with LOCK:
         originals={k:{
             "qty":float(v["qty"]), "avg":float(v["avg"]), "cash":float(v["cash"]),
@@ -827,7 +847,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v11.5 연결 완료\n/status 현재상태\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/news 최신 뉴스\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스 2시간 자동발송\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v11.6 연결 완료\n/status 현재상태\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스 2시간 자동발송\n※ 자동주문 없음",cid)
             elif text.startswith("/sellqty"):
                 try:
                     p=text.split(maxsplit=4)
@@ -876,6 +896,24 @@ def telegram_loop():
                     short="W" if s=="WLD" else "K"
                     send(f"✅ {short} 외부입금 기록 완료\\n입금금액 {amount:,.0f}원\\n재매수 가능 현금 {cash:,.0f}원\\n외부입금 누적 {deposited:,.0f}원",cid)
                 except Exception as e: send(f"⚠️ 입금 기록 실패: {e}",cid)
+            elif text.startswith("/cashset"):
+                try:
+                    p=text.split(maxsplit=3)
+                    if len(p)<3:
+                        raise ValueError("사용법: /cashset W 0 실제잔액정정")
+                    reason=p[3] if len(p)>3 else ""
+                    r=record_cashset(p[1],p[2],reason)
+                    short="W" if r["symbol"]=="WLD" else "K"
+                    send(
+                        f"✅ {short} 재매수 현금 잔액 정정 완료\n"
+                        f"정정 전 {r['before']:,.0f}원\n"
+                        f"정정 후 {r['cash']:,.0f}원\n"
+                        f"※ 개인인출/외부입금/실현손익 누계는 변경하지 않음"
+                        + (f"\n메모 {r['reason']}" if r["reason"] else ""),
+                        cid
+                    )
+                except Exception as e:
+                    send(f"⚠️ 현금 잔액 정정 실패: {e}",cid)
             elif text.startswith("/withdraw"):
                 try:
                     p=text.split(maxsplit=3)
@@ -897,7 +935,7 @@ def telegram_loop():
             elif text.startswith("/position"):
                 send(position_text(),cid)
             elif text.split()[0].split("@")[0].lower() == "/version" if text else False:
-                send("✅ Jaina Coin Monitor v11.5 실행 중", cid)
+                send("✅ Jaina Coin Monitor v11.6 실행 중", cid)
             elif text.split()[0].split("@")[0].lower() == "/booktest" if text else False:
                 # 먼저 수신 확인을 보내므로, 긴 테스트 전에 명령 수신 여부를 즉시 알 수 있다.
                 send("🧪 /booktest 명령 수신 — 장부 무변경 안전 테스트 시작", cid)
