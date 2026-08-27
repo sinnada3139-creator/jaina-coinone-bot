@@ -300,7 +300,7 @@ def position_text():
 
 def booktest_text():
     """매매장부를 변경하지 않고 매도→개인인출→재매수 흐름을 계산만 해본다."""
-    lines=["🧪 v12.0 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
+    lines=["🧪 v12.1 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
     with LOCK:
         originals={k:{
             "qty":float(v["qty"]), "avg":float(v["avg"]), "cash":float(v["cash"]),
@@ -336,7 +336,7 @@ def booktest_text():
               "", ("🎉 /booktest 전체 통과 — 실제 운영 가능" if unchanged else "⚠️ 운영 중지 — 장부 변경 여부 확인 필요")]
     return "\n".join(lines)
 
-# v12.0 trend filter: Coinone public candle data only (no account API / no auto-order)
+# v12.1 trend filter: Coinone public candle data only (no account API / no auto-order)
 # ---------- 09:00 KST DAILY REFERENCE ----------
 KST = timezone(timedelta(hours=9))
 DAY_REF_CACHE = {}
@@ -772,6 +772,26 @@ def send(text,cid):
     if cid:
         tg("sendMessage",{"chat_id":cid,"text":text})
 
+def send_long(text,cid,limit=3800):
+    """Telegram 길이 제한을 피해서 긴 뉴스/호재 브리핑을 여러 메시지로 나눠 보낸다."""
+    if not cid or not text:
+        return
+    text=str(text)
+    if len(text)<=limit:
+        send(text,cid)
+        return
+    buf=[]
+    size=0
+    for line in text.splitlines():
+        add=len(line)+1
+        if buf and size+add>limit:
+            send("\n".join(buf),cid)
+            buf=[line]; size=add
+        else:
+            buf.append(line); size+=add
+    if buf:
+        send("\n".join(buf),cid)
+
 def alert_text(symbol,d):
     return (
         f"【자이나 코인봇】 {symbol}/KRW\n"
@@ -864,8 +884,12 @@ def snapshot():
 
 
 # ---------- NEWS / MARKET ----------
-NEWS_INTERVAL = 2 * 60 * 60
+NEWS_INTERVAL = 3 * 60 * 60
 LAST_NEWS_SENT = 0.0
+LAST_BREAKING_CHECK = 0.0
+BREAKING_CHECK_INTERVAL = 10 * 60   # 10분마다 새 중요 호재/악재 확인
+SEEN_BREAKING_KEYS = set()
+BREAKING_PRIMED = False
 
 POS_WORDS = [
     "partnership","partner","launch","upgrade","adoption","integration",
@@ -985,6 +1009,45 @@ def catalyst_search(symbol):
         "themes":themes
     }
 
+
+def news_key(item):
+    return ((item.get("title") or "").strip().lower() + "|" + (item.get("source") or "").strip().lower())
+
+def breaking_candidates():
+    """W/K의 새 중요 호재·악재 후보를 모은다. 점수 기준을 높게 잡아 잡음 알림을 줄인다."""
+    out=[]
+    for symbol in ("WLD","KAIA"):
+        r=catalyst_search(symbol)
+        for it in r.get("positive",[]):
+            sc=catalyst_score_item(it)
+            # 파트너십/출시/채택/상장 등 키워드가 복수로 잡히거나 신뢰도 높은 출처인 경우
+            if sc>=5:
+                out.append(("positive",symbol,sc,it))
+        for it in r.get("risks",[]):
+            title=(it.get("title") or "").lower()
+            risk_hits=sum(1 for w in RISK_WORDS if w.lower() in title)
+            if risk_hits>=1:
+                out.append(("risk",symbol,-max(4,risk_hits*2),it))
+    return out
+
+def breaking_check_text(new_items):
+    if not new_items:
+        return ""
+    parts=["🚨 【자이나 중요 호재·악재 즉시 레이더】"]
+    for kind,symbol,sc,it in new_items[:5]:
+        short="W" if symbol=="WLD" else "K"
+        icon="🚀" if kind=="positive" else "⚠️"
+        label="중요 호재 후보" if kind=="positive" else "중요 리스크 후보"
+        src=f" · {it.get('source')}" if it.get("source") else ""
+        parts.append(
+            f"\n{icon} {short} {label}\n"
+            f"{it.get('title','')}{src}\n"
+            f"{it.get('link','')}"
+        )
+    parts.append("\n※ 기사 제목/출처 기반 자동 감지입니다. 실제 영향은 공식 발표와 시장 반응을 함께 확인하세요.")
+    return "\n".join(parts)
+
+
 def good_radar_text():
     parts=["🚀 【자이나 호재·전망 레이더】"]
     try:
@@ -1101,15 +1164,43 @@ def news_digest():
     return "\n".join(parts)
 
 def auto_news_loop():
-    global LAST_NEWS_SENT
+    global LAST_NEWS_SENT, LAST_BREAKING_CHECK, BREAKING_PRIMED, SEEN_BREAKING_KEYS
     while True:
         try:
-            if CHAT_ID and time.time() - LAST_NEWS_SENT >= NEWS_INTERVAL:
-                send(news_digest(), CHAT_ID)
-                LAST_NEWS_SENT = time.time()
-                print("[News] digest sent", flush=True)
+            now=time.time()
+
+            # 3시간마다: 시황 뉴스 + W/K 호재·전망·리스크 종합보고
+            if CHAT_ID and now - LAST_NEWS_SENT >= NEWS_INTERVAL:
+                send_long("🕒 3시간 정기 뉴스·호재·전망 보고\n\n" + news_digest(), CHAT_ID)
+                send_long(good_radar_text(), CHAT_ID)
+                LAST_NEWS_SENT = now
+                print("[News] 3h news+catalyst digest sent", flush=True)
+
+            # 10분마다 새 중요 호재/악재 확인. 시작 직후 기존 기사들은 기준선으로만 등록.
+            if CHAT_ID and now - LAST_BREAKING_CHECK >= BREAKING_CHECK_INTERVAL:
+                candidates=breaking_candidates()
+                keys={news_key(it) for _,_,_,it in candidates if news_key(it)}
+                if not BREAKING_PRIMED:
+                    SEEN_BREAKING_KEYS.update(keys)
+                    BREAKING_PRIMED=True
+                    print("[News] breaking radar primed", len(keys), flush=True)
+                else:
+                    fresh=[]
+                    for row in candidates:
+                        k=news_key(row[3])
+                        if k and k not in SEEN_BREAKING_KEYS:
+                            fresh.append(row)
+                            SEEN_BREAKING_KEYS.add(k)
+                    if fresh:
+                        send_long(breaking_check_text(fresh), CHAT_ID)
+                        print("[News] breaking catalyst alert sent", len(fresh), flush=True)
+                # 메모리 폭주 방지
+                if len(SEEN_BREAKING_KEYS)>500:
+                    SEEN_BREAKING_KEYS=set(list(SEEN_BREAKING_KEYS)[-300:])
+                LAST_BREAKING_CHECK=now
+
         except Exception as e:
-            print("[News] error", e, flush=True)
+            print("[News] error",e,flush=True)
         time.sleep(60)
 # ---------- END NEWS ----------
 
@@ -1255,7 +1346,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v11.6 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스 2시간 자동발송\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v11.6 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n※ 자동주문 없음",cid)
             elif text.startswith("/sellqty"):
                 try:
                     p=text.split(maxsplit=4)
@@ -1350,7 +1441,7 @@ def telegram_loop():
                     print("[Telegram] /trend error", repr(e), flush=True)
                     send(f"⚠️ 추세 조회 오류: {type(e).__name__}: {e}", cid)
             elif text.split()[0].split("@")[0].lower() == "/version" if text else False:
-                send("✅ Jaina Coin Monitor v12.0 실행 중", cid)
+                send("✅ Jaina Coin Monitor v12.1 실행 중", cid)
             elif text.split()[0].split("@")[0].lower() == "/booktest" if text else False:
                 # 먼저 수신 확인을 보내므로, 긴 테스트 전에 명령 수신 여부를 즉시 알 수 있다.
                 send("🧪 /booktest 명령 수신 — 장부 무변경 안전 테스트 시작", cid)
@@ -1378,16 +1469,16 @@ def telegram_loop():
                 except Exception as e:
                     send(f"⚠️ 시세 조회 오류: {e}",cid)
             elif text.split()[0].split("@")[0].lower() == "/good" if text else False:
-                send("🚀 W·K 호재·전망 자료를 넓게 수집하고 있습니다.",cid)
+                send("🚀 W·K 호재·전망 자료를 넓게 수집하고 있습니다. (정기보고는 3시간마다)",cid)
                 try:
-                    send(good_radar_text(),cid)
+                    send_long(good_radar_text(),cid)
                 except Exception as e:
                     print("[Telegram] /good error", repr(e), flush=True)
                     send(f"⚠️ 호재 레이더 조회 오류: {type(e).__name__}: {e}",cid)
             elif text.startswith("/news"):
                 send("📰 최신 뉴스를 수집하고 있습니다. 잠시만 기다려 주세요.",cid)
                 try:
-                    send(news_digest(),cid)
+                    send_long(news_digest(),cid)
                 except Exception as e:
                     send(f"⚠️ 뉴스 조회 오류: {e}",cid)
             elif text.startswith("/market"):
