@@ -1,4 +1,5 @@
 import os, time, threading, requests, json, html
+from datetime import datetime, timedelta, timezone
 from collections import deque
 from urllib.parse import quote_plus
 import xml.etree.ElementTree as ET
@@ -299,7 +300,7 @@ def position_text():
 
 def booktest_text():
     """매매장부를 변경하지 않고 매도→개인인출→재매수 흐름을 계산만 해본다."""
-    lines=["🧪 v11.8 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
+    lines=["🧪 v11.9 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
     with LOCK:
         originals={k:{
             "qty":float(v["qty"]), "avg":float(v["avg"]), "cash":float(v["cash"]),
@@ -335,7 +336,87 @@ def booktest_text():
               "", ("🎉 /booktest 전체 통과 — 실제 운영 가능" if unchanged else "⚠️ 운영 중지 — 장부 변경 여부 확인 필요")]
     return "\n".join(lines)
 
-# v11.8 trend filter: Coinone public candle data only (no account API / no auto-order)
+# v11.9 trend filter: Coinone public candle data only (no account API / no auto-order)
+# ---------- 09:00 KST DAILY REFERENCE ----------
+KST = timezone(timedelta(hours=9))
+DAY_REF_CACHE = {}
+DAY_REF_CACHE_TTL = 60
+
+def _candle_ts_seconds(v):
+    x=safe_float(v)
+    if x > 10_000_000_000:  # milliseconds -> seconds
+        x /= 1000.0
+    return x
+
+def _session_9am_targets():
+    now_kst=datetime.now(KST)
+    today9=now_kst.replace(hour=9,minute=0,second=0,microsecond=0)
+    # 09:00 이전에는 현재 세션 기준점이 전날 09:00
+    if now_kst < today9:
+        today9 -= timedelta(days=1)
+    prev9=today9-timedelta(days=1)
+    return today9, prev9
+
+def _nearest_9am_open(rows, target_dt):
+    target_ts=target_dt.timestamp()
+    best=None
+    best_gap=10**30
+    for row in rows:
+        ts=_candle_ts_seconds(row.get("timestamp"))
+        if ts<=0:
+            continue
+        gap=abs(ts-target_ts)
+        if gap<best_gap:
+            best=row
+            best_gap=gap
+    # 1시간봉 기준 09:00에서 지나치게 먼 캔들은 사용하지 않음
+    if not best or best_gap > 2*60*60:
+        return 0.0
+    p=safe_float(best.get("open"))
+    if p<=0:
+        p=safe_float(best.get("close"))
+    return p
+
+def daily_reference(symbol, current_price):
+    now=time.time()
+    cached=DAY_REF_CACHE.get(symbol)
+    if cached and now-cached.get("ts",0)<DAY_REF_CACHE_TTL:
+        d=dict(cached["data"])
+        p=safe_float(current_price)
+        if d.get("ready"):
+            d["today_change_pct"]=pct(p,d.get("today_9_price")) if p and d.get("today_9_price") else 0.0
+            d["prev24_change_pct"]=pct(p,d.get("prev_9_price")) if p and d.get("prev_9_price") else 0.0
+        return d
+    try:
+        rows=fetch_chart(symbol,"1h",72)
+        today9,prev9=_session_9am_targets()
+        today_price=_nearest_9am_open(rows,today9)
+        prev_price=_nearest_9am_open(rows,prev9)
+        if today_price<=0 or prev_price<=0:
+            raise RuntimeError("09시 기준가를 찾지 못함")
+        p=safe_float(current_price)
+        data={
+            "ready":True,
+            "today_9_price":today_price,
+            "prev_9_price":prev_price,
+            "today_label":today9.strftime("%m/%d 09:00"),
+            "prev_label":prev9.strftime("%m/%d 09:00"),
+            "today_change_pct":pct(p,today_price) if p else 0.0,
+            "prev24_change_pct":pct(p,prev_price) if p else 0.0,
+        }
+    except Exception as e:
+        data={
+            "ready":False,
+            "error":str(e),
+            "today_change_pct":0.0,
+            "prev24_change_pct":0.0,
+        }
+    DAY_REF_CACHE[symbol]={"ts":now,"data":data}
+    return dict(data)
+
+def move_mark(v):
+    return "🟢" if v>0.05 else ("🔴" if v<-0.05 else "⚪")
+
 TREND_CACHE = {}
 TREND_CACHE_TTL = 60
 
@@ -364,7 +445,7 @@ def macd_values(values):
 
 def fetch_chart(symbol, interval, size=120):
     url=f"https://api.coinone.co.kr/public/v2/chart/KRW/{symbol}"
-    r=SESSION.get(url,params={"interval":interval,"size":size},headers={"User-Agent":"JainaCoinMonitor/11.7"},timeout=(5,10))
+    r=SESSION.get(url,params={"interval":interval,"size":size},headers={"User-Agent":"JainaCoinMonitor/11.9"},timeout=(5,10))
     r.raise_for_status(); j=r.json()
     if j.get("result")!="success": raise RuntimeError(str(j))
     rows=j.get("chart",[])
@@ -422,8 +503,11 @@ def trend_analysis(symbol):
 def trend_report_text():
     """현재 WLD/KAIA의 단기·중기 추세와 매도 판단 보조를 한눈에 보여준다."""
     parts=["📈 【자이나 추세판단】"]
+    ticks=fetch_tickers()
     for symbol in ("WLD","KAIA"):
         t=trend_analysis(symbol)
+        current_p=safe_float((ticks.get(symbol) or {}).get("price"))
+        day=daily_reference(symbol,current_p) if current_p>0 else {"ready":False}
         short_name="W" if symbol=="WLD" else "K"
         if not t.get("ready"):
             parts.append(
@@ -445,6 +529,8 @@ def trend_report_text():
 
         parts.append(
             f"\n{short_name} ({symbol})\n"
+            f"{(move_mark(day.get('today_change_pct',0)) + ' 오늘09시 대비 ' + format(day.get('today_change_pct',0), '+.2f') + '%' + chr(10)) if day.get('ready') else '📅 09시 등락률 확인중' + chr(10)}"
+            f"{(move_mark(day.get('prev24_change_pct',0)) + ' 전일09시 대비 ' + format(day.get('prev24_change_pct',0), '+.2f') + '%' + chr(10)) if day.get('ready') else ''}"
             f"추세신뢰도 {score}/100 · {t.get('label','')}\n"
             f"단기 15분봉: EMA20/60 {'🟢' if s.get('ema_bull') else '🔴'} · "
             f"EMA20기울기 {s.get('slope',0):+.2f}% · RSI {s.get('rsi',50):.1f} · "
@@ -523,6 +609,7 @@ def strategy(symbol, tick):
         rebuy_note=""
         phase="관찰"
         trend=trend_analysis(symbol)
+        daily=daily_reference(symbol,p)
 
         # 0) 급락 방어가 최우선
         if price_dd<=-25:
@@ -664,6 +751,7 @@ def strategy(symbol, tick):
             "rebuy_note":rebuy_note,
             "phase":phase,
             "trend":trend,
+            "daily":daily,
             "trend_note":trend_note,
         }
 
@@ -688,6 +776,8 @@ def alert_text(symbol,d):
     return (
         f"【자이나 코인봇】 {symbol}/KRW\n"
         f"현재가 {d['price']:,.4f}원\n"
+        f"{(move_mark(d.get('daily',{}).get('today_change_pct',0)) + ' 오늘09시 대비 ' + format(d.get('daily',{}).get('today_change_pct',0), '+.2f') + '%' + chr(10)) if d.get('daily',{}).get('ready') else '📅 오늘09시 대비 확인중' + chr(10)}"
+        f"{(move_mark(d.get('daily',{}).get('prev24_change_pct',0)) + ' 전일09시 대비 ' + format(d.get('daily',{}).get('prev24_change_pct',0), '+.2f') + '%' + chr(10)) if d.get('daily',{}).get('ready') else ''}"
         f"평단대비 {d['gain_pct']:+.2f}%\n"
         f"고점대비 {d['drawdown_pct']:+.2f}%\n"
         f"1분 {d['ret1m']:+.2f}% / 5분 {d['ret5m']:+.2f}%\n"
@@ -1094,7 +1184,7 @@ def telegram_loop():
                     print("[Telegram] /trend error", repr(e), flush=True)
                     send(f"⚠️ 추세 조회 오류: {type(e).__name__}: {e}", cid)
             elif text.split()[0].split("@")[0].lower() == "/version" if text else False:
-                send("✅ Jaina Coin Monitor v11.8 실행 중", cid)
+                send("✅ Jaina Coin Monitor v11.9 실행 중", cid)
             elif text.split()[0].split("@")[0].lower() == "/booktest" if text else False:
                 # 먼저 수신 확인을 보내므로, 긴 테스트 전에 명령 수신 여부를 즉시 알 수 있다.
                 send("🧪 /booktest 명령 수신 — 장부 무변경 안전 테스트 시작", cid)
@@ -1154,6 +1244,7 @@ async function g(){
       <b>${s}/KRW</b>
       <div class="p">${p.toLocaleString()}원</div>
       <div class="ok">🟢 코인원 연결</div>
+      <small>${c.daily&&c.daily.ready?`📅 오늘09시 대비 ${Number(c.daily.today_change_pct||0)>=0?"+":""}${Number(c.daily.today_change_pct||0).toFixed(2)}% · 전일09시 대비 ${Number(c.daily.prev24_change_pct||0)>=0?"+":""}${Number(c.daily.prev24_change_pct||0).toFixed(2)}%<br>`:""}</small>
       <small>평단 ${avg.toLocaleString()}원 · 평단대비 ${gp.toFixed(2)}%<br>
       최근고점 ${peak.toLocaleString()}원 · 고점대비 ${dd.toFixed(2)}%<br>
       1분 ${r1.toFixed(2)}% · 5분 ${r5.toFixed(2)}% · 거래량비 ${vr.toFixed(2)}배<br>
