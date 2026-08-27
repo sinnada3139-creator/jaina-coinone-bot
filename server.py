@@ -300,7 +300,7 @@ def position_text():
 
 def booktest_text():
     """매매장부를 변경하지 않고 매도→개인인출→재매수 흐름을 계산만 해본다."""
-    lines=["🧪 v11.9 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
+    lines=["🧪 v12.0 장부 안전 테스트", "※ 실제 보유수량/현금/평단/저장파일은 변경하지 않습니다."]
     with LOCK:
         originals={k:{
             "qty":float(v["qty"]), "avg":float(v["avg"]), "cash":float(v["cash"]),
@@ -336,7 +336,7 @@ def booktest_text():
               "", ("🎉 /booktest 전체 통과 — 실제 운영 가능" if unchanged else "⚠️ 운영 중지 — 장부 변경 여부 확인 필요")]
     return "\n".join(lines)
 
-# v11.9 trend filter: Coinone public candle data only (no account API / no auto-order)
+# v12.0 trend filter: Coinone public candle data only (no account API / no auto-order)
 # ---------- 09:00 KST DAILY REFERENCE ----------
 KST = timezone(timedelta(hours=9))
 DAY_REF_CACHE = {}
@@ -878,6 +878,169 @@ NEG_WORDS = [
     "해킹","소송","조사","금지","상폐","급락","매도","장애","사기","악재","위험"
 ]
 
+CATALYST_WORDS = [
+    "partnership","partner","launch","upgrade","adoption","integration","expansion",
+    "mainnet","testnet","funding","investment","listing","listed","ecosystem",
+    "developer","grant","stablecoin","payment","wallet","identity","world id",
+    "world chain","orb","mini dapp","miniapp","sdk","api",
+    "파트너십","협력","출시","업그레이드","채택","통합","확장","메인넷","테스트넷",
+    "투자","펀딩","상장","생태계","개발자","그랜트","스테이블코인","결제","지갑",
+    "월드 ID","월드체인","미니 디앱","미니앱"
+]
+
+RISK_WORDS = [
+    "unlock","token unlock","regulation","regulatory","lawsuit","investigation",
+    "ban","delist","hack","exploit","outage","sell-off","fraud",
+    "언락","토큰 언락","규제","소송","조사","금지","상폐","해킹","취약점","장애","매도"
+]
+
+HIGH_TRUST_SOURCES = (
+    "Reuters","Bloomberg","CoinDesk","The Block","Fortune","Forbes",
+    "TechCrunch","Yahoo Finance","BusinessWire","PR Newswire",
+    "Kaia","Kaia Foundation","World","Worldcoin","World Foundation"
+)
+
+def source_weight(source):
+    s=(source or "").lower()
+    if any(x.lower() in s for x in HIGH_TRUST_SOURCES):
+        return 2
+    return 1
+
+def catalyst_score_item(item):
+    text=((item.get("title") or "")+" "+(item.get("source") or "")).lower()
+    pos=sum(1 for w in CATALYST_WORDS if w.lower() in text)
+    risk=sum(1 for w in RISK_WORDS if w.lower() in text)
+    return pos*2 + source_weight(item.get("source")) - risk*2
+
+def _dedupe_news(items):
+    seen=set(); out=[]
+    for x in items:
+        key=(x.get("title") or "").lower().strip()
+        if not key or key in seen:
+            continue
+        seen.add(key); out.append(x)
+    return out
+
+def catalyst_search(symbol):
+    if symbol=="WLD":
+        positive_queries=[
+            '"Worldcoin" OR "World Network" partnership launch expansion adoption integration when:30d',
+            '"World Chain" OR "World ID" OR Orb launch integration adoption when:30d',
+            'WLD Worldcoin ecosystem developer grant funding listing when:30d',
+        ]
+        risk_query='"Worldcoin" OR WLD regulation lawsuit investigation token unlock hack when:30d'
+        themes=[
+            "World ID 실제 사용처·인증 확대",
+            "World Chain 앱/개발자/TVL 생태계 성장",
+            "Orb 보급·국가 확장과 규제 진행",
+            "거래소·기관·기업 파트너십",
+            "토큰 언락/공급 증가 일정"
+        ]
+    else:
+        positive_queries=[
+            'KAIA blockchain partnership launch ecosystem adoption integration when:30d',
+            '"Kaia" stablecoin payment wallet mini dapp mainnet when:30d',
+            'KAIA developer grant funding listing ecosystem when:30d',
+        ]
+        risk_query='KAIA blockchain regulation delist hack outage token unlock when:30d'
+        themes=[
+            "LINE/Kakao 기반 서비스·미니앱 확장",
+            "스테이블코인·결제·지갑 채택",
+            "DApp/DeFi/게임 생태계와 온체인 활동",
+            "파트너십·상장·개발자 지원",
+            "토큰 공급/언락 및 네트워크 리스크"
+        ]
+
+    positives=[]
+    for q in positive_queries:
+        try:
+            positives += google_news_rss(q, 6)
+        except Exception:
+            pass
+    positives=_dedupe_news(positives)
+    positives=sorted(positives, key=catalyst_score_item, reverse=True)
+
+    try:
+        risks=_dedupe_news(google_news_rss(risk_query, 5))
+    except Exception:
+        risks=[]
+
+    strong=[x for x in positives if catalyst_score_item(x)>=3]
+    medium=[x for x in positives if 1<=catalyst_score_item(x)<3]
+    # 정보 강도: 뉴스 개수 + 출처 질. 가격 상승확률이 아님.
+    info_score=min(100, len(strong)*18 + len(medium)*7 + sum(source_weight(x.get("source")) for x in strong[:4])*3)
+    if info_score>=70:
+        label="🟢 호재 정보 풍부"
+    elif info_score>=40:
+        label="🟡 호재 정보 보통"
+    else:
+        label="⚪ 뚜렷한 신규 호재 적음"
+
+    return {
+        "symbol":symbol,
+        "score":info_score,
+        "label":label,
+        "positive":positives[:5],
+        "risks":risks[:3],
+        "themes":themes
+    }
+
+def good_radar_text():
+    parts=["🚀 【자이나 호재·전망 레이더】"]
+    try:
+        snap=snapshot()
+    except Exception:
+        snap={}
+    for symbol in ("WLD","KAIA"):
+        short="W" if symbol=="WLD" else "K"
+        r=catalyst_search(symbol)
+        trend=((snap.get(symbol) or {}).get("trend") or {})
+        trend_score=int(trend.get("score",0) or 0)
+        parts += [
+            "",
+            f"{short} ({symbol})",
+            f"호재정보강도 {r['score']}/100 · {r['label']}",
+            f"추세신뢰도 {trend_score}/100 · {trend.get('label','⚪ 확인중')}",
+            "🟢 최근 긍정 재료"
+        ]
+        if r["positive"]:
+            for i,it in enumerate(r["positive"][:4],1):
+                src=f" · {it.get('source')}" if it.get("source") else ""
+                parts.append(f"{i}. {it['title']}{src}\n{it['link']}")
+        else:
+            parts.append("최근 30일 뚜렷한 신규 호재 기사 부족")
+
+        parts.append("🔎 앞으로 볼 핵심")
+        for x in r["themes"][:4]:
+            parts.append(f"• {x}")
+
+        parts.append("⚠️ 리스크 레이더")
+        if r["risks"]:
+            for i,it in enumerate(r["risks"][:2],1):
+                src=f" · {it.get('source')}" if it.get("source") else ""
+                parts.append(f"{i}. {it['title']}{src}")
+        else:
+            parts.append("검색 범위에서 새 주요 리스크 기사 없음")
+
+        if trend_score>=75 and r["score"]>=60:
+            view="🟢 추세와 재료가 함께 강함 — 상승 지속 여부 관찰 가치 높음"
+        elif trend_score>=75 and r["score"]<40:
+            view="🟡 가격 추세는 강하지만 신규 호재 근거는 약함 — 과열 여부 함께 확인"
+        elif trend_score<60 and r["score"]>=60:
+            view="🟡 호재는 있으나 가격 추세 확인 필요 — 뉴스만 보고 추격매수 금지"
+        else:
+            view="⚪ 재료·추세 혼조 — 확인된 변화가 나올 때까지 관찰"
+        parts.append(f"🔭 종합전망 {view}")
+
+    parts += [
+        "",
+        "※ 호재정보강도는 최근 기사·출처·키워드의 정보량 점수이며 가격 상승확률이 아닙니다.",
+        "※ 공식 발표/신뢰도 높은 매체를 우선하고 루머성 제목은 판단 근거에서 낮게 봅니다.",
+        "※ 자동주문 없음 — 최종 매매는 코인원 앱에서 직접 판단"
+    ]
+    return "\n".join(parts)
+
+
 def google_news_rss(query, limit=4):
     url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=ko&gl=KR&ceid=KR:ko"
     r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=(5,12))
@@ -887,7 +1050,9 @@ def google_news_rss(query, limit=4):
     for item in root.findall(".//item")[:limit]:
         title = html.unescape((item.findtext("title") or "").strip())
         link = (item.findtext("link") or "").strip()
-        items.append({"title": title, "link": link})
+        source = html.unescape((item.findtext("source") or "").strip())
+        pubdate = (item.findtext("pubDate") or "").strip()
+        items.append({"title": title, "link": link, "source": source, "pubdate": pubdate})
     return items
 
 def classify_news(title):
@@ -930,6 +1095,7 @@ def news_digest():
         except Exception as e:
             parts.append(f"뉴스 조회 지연 ({type(e).__name__})")
         parts.append("")
+    parts.append("🚀 더 넓은 호재·예정재료·리스크는 /good 입력")
     parts.append("🟢 긍정 가능성 · 🔴 부정 가능성 · ⚪ 중립/판단보류")
     parts.append("※ 제목 키워드 기반 분류이며 투자 판단을 보장하지 않습니다.")
     return "\n".join(parts)
@@ -1089,7 +1255,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v11.6 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스 2시간 자동발송\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v11.6 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스 2시간 자동발송\n※ 자동주문 없음",cid)
             elif text.startswith("/sellqty"):
                 try:
                     p=text.split(maxsplit=4)
@@ -1184,7 +1350,7 @@ def telegram_loop():
                     print("[Telegram] /trend error", repr(e), flush=True)
                     send(f"⚠️ 추세 조회 오류: {type(e).__name__}: {e}", cid)
             elif text.split()[0].split("@")[0].lower() == "/version" if text else False:
-                send("✅ Jaina Coin Monitor v11.9 실행 중", cid)
+                send("✅ Jaina Coin Monitor v12.0 실행 중", cid)
             elif text.split()[0].split("@")[0].lower() == "/booktest" if text else False:
                 # 먼저 수신 확인을 보내므로, 긴 테스트 전에 명령 수신 여부를 즉시 알 수 있다.
                 send("🧪 /booktest 명령 수신 — 장부 무변경 안전 테스트 시작", cid)
@@ -1211,6 +1377,13 @@ def telegram_loop():
                     send("\n\n".join(parts),cid)
                 except Exception as e:
                     send(f"⚠️ 시세 조회 오류: {e}",cid)
+            elif text.split()[0].split("@")[0].lower() == "/good" if text else False:
+                send("🚀 W·K 호재·전망 자료를 넓게 수집하고 있습니다.",cid)
+                try:
+                    send(good_radar_text(),cid)
+                except Exception as e:
+                    print("[Telegram] /good error", repr(e), flush=True)
+                    send(f"⚠️ 호재 레이더 조회 오류: {type(e).__name__}: {e}",cid)
             elif text.startswith("/news"):
                 send("📰 최신 뉴스를 수집하고 있습니다. 잠시만 기다려 주세요.",cid)
                 try:
