@@ -1174,6 +1174,82 @@ def _news_cache_put(query, items):
             for k,_ in sorted(NEWS_CACHE.items(), key=lambda kv:kv[1].get("ts",0))[:20]:
                 NEWS_CACHE.pop(k,None)
 
+def _parse_rss_items(content, limit=6, forced_source=""):
+    """RSS/Atom을 공통 형식으로 변환. 개별 피드 오류는 빈 배열로 격리."""
+    root=ET.fromstring(content)
+    items=[]
+    # RSS 2.0
+    for item in root.findall(".//item")[:limit]:
+        title=html.unescape((item.findtext("title") or "").strip())
+        link=(item.findtext("link") or "").strip()
+        source=html.unescape((item.findtext("source") or forced_source or "").strip())
+        pubdate=(item.findtext("pubDate") or item.findtext("date") or "").strip()
+        if title:
+            items.append({"title":title,"link":link,"source":source,"pubdate":pubdate})
+    if items: return items[:limit]
+    # Atom fallback
+    ns={"a":"http://www.w3.org/2005/Atom"}
+    for ent in root.findall(".//a:entry",ns)[:limit]:
+        title=html.unescape((ent.findtext("a:title",default="",namespaces=ns) or "").strip())
+        lk=ent.find("a:link",ns); link=(lk.get("href","") if lk is not None else "")
+        pubdate=(ent.findtext("a:published",default="",namespaces=ns) or ent.findtext("a:updated",default="",namespaces=ns) or "").strip()
+        if title:
+            items.append({"title":title,"link":link,"source":forced_source,"pubdate":pubdate})
+    return items[:limit]
+
+
+def bing_news_rss(query, limit=6):
+    """v13.0 1차 검색 경로: Bing News RSS. Google 장애와 독립된 검색 경로."""
+    key="bing::"+query
+    try:
+        url="https://www.bing.com/news/search?q="+quote_plus(query)+"&format=rss&mkt=en-US"
+        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.0"},timeout=(2.5,5.0))
+        r.raise_for_status()
+        items=_parse_rss_items(r.content,limit,"Bing News")
+        _news_cache_put(key,items)
+        return items
+    except Exception:
+        cached=_news_cache_get(key,limit,True)
+        if cached: return cached
+        raise
+
+
+def direct_crypto_feeds(limit=10):
+    """v13.0 보조 경로: 검색엔진을 거치지 않는 직접 금융/크립토 RSS."""
+    feeds=[
+        ("CoinDesk","https://www.coindesk.com/arc/outboundfeeds/rss/"),
+        ("CNBC","https://www.cnbc.com/id/10000664/device/rss/rss.html"),
+    ]
+    out=[]
+    for source,url in feeds:
+        key="feed::"+source
+        try:
+            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.0"},timeout=(2.5,5.0))
+            r.raise_for_status()
+            items=_parse_rss_items(r.content,limit,source)
+            _news_cache_put(key,items)
+            out.extend(items)
+        except Exception:
+            out.extend(_news_cache_get(key,limit,True))
+    return _dedupe_news(out)
+
+
+def multisource_news(query, limit=7, priority=False):
+    """v13.0: Bing → Google → 캐시. 한 경로 실패가 전체 원인분석을 막지 않는다."""
+    errors=[]; out=[]
+    try:
+        out.extend(bing_news_rss(query,limit))
+    except Exception as e:
+        errors.append("Bing:"+type(e).__name__)
+    # Bing에서 충분히 얻었으면 Google timeout을 굳이 기다리지 않는다.
+    if len(out)<max(3,limit//2):
+        try:
+            out.extend(google_news_rss(query,limit,priority=priority))
+        except Exception as e:
+            errors.append("Google:"+type(e).__name__)
+    return _dedupe_news(out)[:limit], errors
+
+
 def google_news_rss(query, limit=4, priority=False):
     """v12.9: 실시간 RSS → 실패 시 최근 성공 캐시. 반복 timeout 때 짧은 회로차단."""
     now=time.time()
@@ -1183,7 +1259,7 @@ def google_news_rss(query, limit=4, priority=False):
         raise requests.exceptions.ReadTimeout("news circuit open")
     url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=ko&gl=KR&ceid=KR:ko"
     try:
-        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/12.9"}, timeout=(2.5,4.5))
+        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.0"}, timeout=(2.5,4.5))
         r.raise_for_status()
         root = ET.fromstring(r.content)
         items = []
@@ -1252,7 +1328,7 @@ def _news_age_hours(item):
 
 
 def _macro_news(direction="DOWN"):
-    """v12.8 안정화: 24h→48h 심층검색을 병렬 수행하고 개별 HTTP 실패가 전체 분석을 막지 않게 한다."""
+    """v13.0: Bing/직접 RSS/Google/캐시 다중경로 + 24h→48h 심층검색."""
     stage1 = [
         'Bitcoin Federal Reserve chair speech interest rates crypto when:1d',
         'Bitcoin Fed hawkish dovish Treasury yields dollar crypto when:1d',
@@ -1284,7 +1360,8 @@ def _macro_news(direction="DOWN"):
 
     def one(q, limit=7):
         try:
-            return google_news_rss(q, limit, priority=True), None
+            items,errs=multisource_news(q, limit, priority=True)
+            return items, (",".join(errs) if errs else None)
         except Exception as e:
             return [], type(e).__name__
 
@@ -1303,6 +1380,11 @@ def _macro_news(direction="DOWN"):
         return _dedupe_news(out), errors
 
     first, err1=collect_parallel(stage1)
+    # 검색엔진과 독립된 직접 피드를 합쳐 단일 공급자 장애를 피한다.
+    try:
+        first=_dedupe_news(first + direct_crypto_feeds(12))
+    except Exception:
+        pass
     fresh=[x for x in first if _news_age_hours(x)<=30 or _news_age_hours(x)>=999]
     errors=list(err1)
     if len(fresh) < 12:
@@ -1388,7 +1470,7 @@ def _cause_chain(cat, direction):
 
 
 def market_cause_analysis_text(force_direction=None):
-    """v12.8: 24h 기본검색 + 필요 시 48h 심층검색으로 직접 원인을 재탐색한다."""
+    """v13.0: 다중 뉴스 경로 + 24h/48h 심층검색으로 직접 원인을 재탐색한다."""
     move=market_move_snapshot(); btc=move.get("BTC",{})
     btc1=btc.get("ret1") or 0.0; btc5=btc.get("ret5") or 0.0
     try:
@@ -1449,7 +1531,7 @@ def market_cause_analysis_text(force_direction=None):
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v12.9】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v13.0】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if NEWS_HEALTH.get("last_errors",0):
         parts.append(f"⚠️ 뉴스 연결 일부 지연 {NEWS_HEALTH['last_errors']}건 — 확보 기사 {NEWS_HEALTH.get('last_ok',0)}건으로 계속 분석")
         parts.append("")
@@ -1514,7 +1596,7 @@ def market_cause_worker(direction,cid):
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v12.9 급변 원인분석 테스트】\n\n"
+        "🧪 【v13.0 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
@@ -1524,6 +1606,8 @@ def causetest_text():
         "✅ 전망/사전예고 기사 감점 + 실제 발언/발표 우선\n"
         "✅ Reuters/Bloomberg 등 고신뢰 출처 가중\n"
         "✅ 24시간 실패 시 48시간 심층 재검색(한글+영문)\n"
+        "✅ Bing News 1차 + Google News 2차 다중 검색경로\n"
+        "✅ CoinDesk/CNBC 직접 RSS 보조경로 + 최근 성공 캐시\n"
         "✅ 뉴스 요청 3/6초 timeout + 개별 HTTPError 격리\n"
         "✅ 최대 4개 병렬검색 + 일부 뉴스 실패 시 확보 기사로 계속 분석\n"
         "✅ ETF/청산/옵션/나스닥 위험자산 동조 보조탐색\n"
