@@ -115,7 +115,7 @@ STATE = {
 
 load_persistent_state()
 
-# ---------- v12.3 MARKET SHOCK + RAPID MOVE CAUSE ENGINE ----------
+# ---------- v12.4 MARKET SHOCK + TIME-AWARE CAUSE ENGINE ----------
 # BTC는 시장 전체 급변 여부를 판별하기 위한 참고 시세입니다. 자동주문에는 사용하지 않습니다.
 MARKET_HISTORY = {"BTC": deque(maxlen=240)}
 RAPID_LAST = {s:{"ts":0.0,"dir":""} for s in COINS}
@@ -137,7 +137,7 @@ def fetch_tickers():
     r = SESSION.get(
         URL,
         params={"additional_data":"false"},
-        headers={"User-Agent":"JainaCoinMonitor/12.3"},
+        headers={"User-Agent":"JainaCoinMonitor/12.4"},
         timeout=(5,10),
     )
     r.raise_for_status()
@@ -840,7 +840,7 @@ def monitor_loop():
             if btc:
                 with LOCK:
                     MARKET_HISTORY["BTC"].append((time.time(),safe_float(btc.get("price")),safe_float(btc.get("quote_volume"))))
-                # v12.3: BTC가 먼저 급등/급락하면 W/K가 아직 임계치 전이어도 시장 원인을 즉시 분석
+                # v12.4: BTC가 먼저 급등/급락하면 W/K가 아직 임계치 전이어도 시간대 일치 원인을 즉시 분석
                 if CHAT_ID:
                     market_dir=market_shock_triggered()
                     if market_dir:
@@ -1175,25 +1175,48 @@ def market_move_snapshot():
     return {"BTC":{"ret1":btc1,"ret5":btc5}, **coins}
 
 
+def _parse_pub_ts(pubdate):
+    """Google News RSS RFC822 발행시각을 UTC epoch로 변환. 실패하면 0."""
+    try:
+        from email.utils import parsedate_to_datetime
+        dt=parsedate_to_datetime(pubdate or "")
+        if dt.tzinfo is None:
+            dt=dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _news_age_hours(item):
+    ts=_parse_pub_ts(item.get("pubdate"))
+    return max(0.0,(time.time()-ts)/3600.0) if ts else 999.0
+
+
 def _macro_news(direction="DOWN"):
-    """시장 전체 급변의 거시/정책/수급 원인 후보를 넓게 검색한다."""
+    """최근 24시간 거시·수급 원인을 여러 축으로 따로 검색해 한 검색어 누락을 줄인다."""
+    common = [
+        'Bitcoin Federal Reserve chair speech interest rates crypto when:1d',
+        'Bitcoin Fed hawkish dovish Treasury yields dollar crypto when:1d',
+        'Bitcoin inflation PCE CPI jobs payroll crypto market when:1d',
+        'Bitcoin ETF inflow outflow liquidation options expiry crypto when:1d',
+        'Bitcoin regulation hack geopolitical tariff crypto when:1d',
+        '비트코인 연준 의장 금리 국채 달러 가상자산 when:1d',
+        '비트코인 청산 ETF 유출 옵션 만기 규제 해킹 when:1d',
+    ]
     if direction == "UP":
-        queries = [
-            'Bitcoin crypto rally Fed dovish rate cut Treasury yields dollar ETF inflow when:1d',
-            'cryptocurrency market surge regulation approval institutional adoption liquidation when:1d',
-        ]
+        common += ['Bitcoin crypto rally rate cut dovish ETF inflow rebound when:1d']
     else:
-        queries = [
-            'Bitcoin crypto selloff Fed hawkish rate hike Treasury yields dollar inflation jobs when:1d',
-            'cryptocurrency market drop liquidation ETF outflow regulation hack geopolitical when:1d',
-        ]
+        common += ['Bitcoin crypto selloff rate hike hawkish yields dollar liquidation when:1d']
     items=[]
-    for q in queries:
+    for q in common:
         try:
-            items += google_news_rss(q, 7)
+            items += google_news_rss(q, 6)
         except Exception:
             pass
-    return _dedupe_news(items)[:12]
+    # 실제 최근 기사만 남기되 RSS 시각 파싱 실패 기사는 후보로 유지한다.
+    dedup=_dedupe_news(items)
+    fresh=[x for x in dedup if _news_age_hours(x)<=30 or _news_age_hours(x)>=999]
+    return fresh[:30]
 
 
 def _macro_category(title):
@@ -1201,97 +1224,110 @@ def _macro_category(title):
     groups=[
         ("연준·금리", ("fed","federal reserve","powell","warsh","hawkish","dovish","rate hike","rate cut","interest rate","연준","금리","매파","비둘기파")),
         ("미국 물가·고용", ("inflation","cpi","pce","payroll","jobs","unemployment","물가","고용","실업")),
-        ("달러·국채금리", ("treasury yield","bond yield","dollar","dxy","국채금리","달러")),
-        ("ETF 자금", ("etf inflow","etf outflow","spot bitcoin etf","ETF 유입","ETF 유출")),
-        ("레버리지 청산", ("liquidation","liquidated","leverage","청산","레버리지")),
+        ("달러·국채금리", ("treasury","yield","bond yield","dollar","dxy","국채","국채금리","달러")),
+        ("ETF 자금", ("etf","inflow","outflow","spot bitcoin etf","ETF","유입","유출")),
+        ("레버리지·옵션", ("liquidation","liquidated","leverage","options expiry","option expiry","청산","레버리지","옵션 만기")),
         ("규제·법률", ("regulation","regulator","sec ","ban","lawsuit","규제","당국","소송","금지")),
         ("해킹·보안", ("hack","exploit","breach","해킹","익스플로잇","보안")),
         ("지정학·관세", ("war ","conflict","tariff","geopolitical","전쟁","분쟁","관세","지정학")),
     ]
     for name, words in groups:
-        if any(w in low for w in words):
-            return name
+        if any(w in low for w in words): return name
     return "시장 수급·기타"
 
 
 def _macro_direction_score(title, direction):
     low=(title or "").lower()
     up=("rally","surge","gain","rebound","rate cut","dovish","etf inflow","approval","상승","급등","반등","금리 인하","비둘기파","유입","승인")
-    down=("drop","fall","plunge","selloff","sell-off","rate hike","hawkish","inflation","yield rises","dollar rises","outflow","liquidation","hack","ban","하락","급락","매도","금리 인상","매파","물가","국채금리 상승","달러 강세","유출","청산","해킹","규제")
+    down=("drop","fall","plunge","selloff","sell-off","rate hike","hawkish","inflation","yield","dollar rises","outflow","liquidation","expiry","hack","ban","하락","급락","매도","금리 인상","매파","물가","국채금리","달러 강세","유출","청산","만기","해킹","규제")
     u=sum(1 for w in up if w in low); d=sum(1 for w in down if w in low)
     return (u-d) if direction=="UP" else (d-u)
 
 
+def _cause_chain(cat, direction):
+    down = direction=="DOWN"
+    chains={
+        "연준·금리": "연준의 매파적 신호 → 금리인하 기대 약화/금리 기대 상승 → 위험자산 부담 → BTC 하락" if down else "연준의 완화적 신호 → 금리 부담 완화 → 위험선호 회복 → BTC 상승",
+        "미국 물가·고용": "강한 물가·고용 → 긴축 우려 → 금리/달러 부담 → BTC 하락" if down else "물가·고용 둔화 → 완화 기대 → 위험선호 → BTC 상승",
+        "달러·국채금리": "미 국채금리·달러 상승 → 유동성/위험선호 압박 → BTC 하락" if down else "미 국채금리·달러 하락 → 위험선호 개선 → BTC 상승",
+        "ETF 자금": "현물 ETF 자금 유출 → 현물 매도 압력 → BTC 하락" if down else "현물 ETF 자금 유입 → 현물 수요 증가 → BTC 상승",
+        "레버리지·옵션": "롱 청산·옵션 만기 변동성 → 강제매도/헤지 → 하락폭 확대" if down else "숏 청산·옵션 포지션 조정 → 강제매수 → 상승폭 확대",
+        "규제·법률": "규제 불확실성 확대 → 위험회피 → 크립토 매도 압력" if down else "규제 불확실성 완화 → 위험선호 개선 → 크립토 매수",
+        "해킹·보안": "보안 사고 우려 → 위험회피 → 시장 매도 압력",
+        "지정학·관세": "지정학/관세 불확실성 → 위험회피 → BTC·알트 압력" if down else "지정학 불확실성 완화 → 위험선호 회복",
+    }
+    return chains.get(cat,"시장 수급 변화 → BTC 변동 → WLD·KAIA 동조 가능성")
+
+
 def market_cause_analysis_text(force_direction=None):
-    """수동 /cause에서도 임계치와 무관하게 최신 시장 원인 후보를 설명한다."""
+    """v12.4: 임계치와 무관하게 24시간 뉴스를 검색하고 발행시각·방향·출처로 우선순위를 매긴다."""
     move=market_move_snapshot(); btc=move.get("BTC",{})
     btc1=btc.get("ret1") or 0.0; btc5=btc.get("ret5") or 0.0
     try:
         ticks=fetch_tickers(); bt=ticks.get("BTC") or {}
-        btc24=pct(safe_float(bt.get("price")), safe_float(bt.get("first"))) if safe_float(bt.get("first")) else 0.0
+        btc24=pct(safe_float(bt.get("price")),safe_float(bt.get("first"))) if safe_float(bt.get("first")) else 0.0
         btcprice=safe_float(bt.get("price"))
     except Exception:
         btc24=0.0; btcprice=0.0
 
-    if force_direction in ("UP","DOWN"):
-        direction=force_direction
-    elif abs(btc5)>=0.35:
-        direction="UP" if btc5>0 else "DOWN"
-    elif abs(btc24)>=0.5:
-        direction="UP" if btc24>0 else "DOWN"
+    if force_direction in ("UP","DOWN"): direction=force_direction
+    elif abs(btc5)>=0.35: direction="UP" if btc5>0 else "DOWN"
+    elif abs(btc24)>=0.5: direction="UP" if btc24>0 else "DOWN"
     else:
-        vals=[]
-        for sym in ("WLD","KAIA"):
-            r=move.get(sym,{}).get("ret5")
-            if r is not None: vals.append(r)
-        avg=sum(vals)/len(vals) if vals else 0.0
-        direction="UP" if avg>=0 else "DOWN"
+        vals=[move.get(s,{}).get("ret5") for s in ("WLD","KAIA") if move.get(s,{}).get("ret5") is not None]
+        direction="UP" if (sum(vals)/len(vals) if vals else 0)>=0 else "DOWN"
 
-    items=_macro_news(direction)
     ranked=[]
-    for it in items:
-        sc=_macro_direction_score(it.get("title",""),direction)
-        cat=_macro_category(it.get("title",""))
-        trust=source_weight(it.get("source"))
-        if sc>0 or cat != "시장 수급·기타":
-            ranked.append((sc, trust, cat, it))
-    ranked.sort(key=lambda x:(x[0],x[1]), reverse=True)
+    for it in _macro_news(direction):
+        title=it.get("title",""); cat=_macro_category(title)
+        ds=_macro_direction_score(title,direction); trust=source_weight(it.get("source"))
+        age=_news_age_hours(it)
+        freshness=4 if age<=6 else (3 if age<=12 else (2 if age<=24 else 0))
+        relevance=2 if cat!="시장 수급·기타" else 0
+        total=ds*3 + trust*2 + freshness + relevance
+        if total>=5 and (ds>0 or cat!="시장 수급·기타"):
+            ranked.append((total,ds,trust,freshness,cat,age,it))
+    ranked.sort(key=lambda x:(x[0],x[2],-x[5]),reverse=True)
 
-    categories=[]
-    for sc,trust,cat,it in ranked:
-        if cat not in categories: categories.append(cat)
-    confidence=25
-    if abs(btc5)>=1.0: confidence+=15
-    if abs(btc24)>=2.0: confidence+=10
-    if ranked: confidence+=20
-    if ranked and ranked[0][0]>=2: confidence+=15
-    if len(categories)>=2: confidence+=10
+    # 같은 제목/카테고리 반복을 줄여 서로 다른 원인 축을 보여준다.
+    selected=[]; seen_cats=set()
+    for row in ranked:
+        if row[4] not in seen_cats:
+            selected.append(row); seen_cats.add(row[4])
+        if len(selected)>=3: break
+    if len(selected)<3:
+        for row in ranked:
+            if row not in selected: selected.append(row)
+            if len(selected)>=3: break
+
+    confidence=20
+    if abs(btc24)>=1: confidence+=8
+    if abs(btc24)>=2: confidence+=7
+    if selected: confidence+=20
+    if selected and selected[0][0]>=12: confidence+=15
+    if selected and selected[0][5]<=12: confidence+=10
+    if len(seen_cats)>=2: confidence+=8
     confidence=max(20,min(92,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[
-        f"🌐 【현재 시장 {label} 원인 분석】",
-        f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",
-        "",
-    ]
-    if ranked:
-        topcats=categories[:3]
-        parts.append("🔎 가능성 높은 원인: " + " → ".join(topcats))
-        parts.append(f"🎯 원인 신뢰도 {confidence}/100")
-        parts.append("\n📰 근거가 된 최신 기사 후보")
-        for sc,trust,cat,it in ranked[:3]:
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v12.4】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    if selected:
+        top=selected[0]; topcat=top[4]
+        parts += [f"🥇 1순위 원인 — {topcat}",_cause_chain(topcat,direction),f"🎯 원인 신뢰도 {confidence}/100",""]
+        if len(selected)>1:
+            parts.append("🔎 보조 원인/변동성 확대 요인")
+            for i,row in enumerate(selected[1:3],2): parts.append(f"{i}순위 {row[4]} — {_cause_chain(row[4],direction)}")
+        parts.append("\n📰 기사 근거 · 시간 일치도")
+        for row in selected[:3]:
+            _,_,_,_,cat,age,it=row
             src=f" · {it.get('source')}" if it.get('source') else ""
-            parts.append(f"• [{cat}] {it.get('title','')}{src}\n{it.get('link','')}")
-        parts.append("\n📌 판단: 가격 움직임과 기사 시간대·방향이 함께 맞는 원인을 우선 표시했습니다.")
+            age_txt=f"약 {age:.1f}시간 전" if age<100 else "발행시각 확인불가"
+            parts.append(f"• [{cat} · {age_txt}] {it.get('title','')}{src}\n{it.get('link','')}")
+        parts.append("\n📌 판단: 최근 24시간 기사 중 가격 방향·발행시각·출처 신뢰도를 함께 점수화했습니다.")
     else:
-        parts += [
-            "🔎 현재 가격 움직임과 시간대가 맞는 직접 원인을 확인하지 못했습니다.",
-            "🎯 원인 신뢰도 20/100",
-            "📌 판단: 뉴스 없는 수급성 움직임일 수 있으므로 억지로 원인을 단정하지 않습니다.",
-        ]
+        parts += ["🔎 최근 24시간 범위까지 넓혀 검색했지만 가격 방향과 시간대가 함께 맞는 직접 원인을 확인하지 못했습니다.","🎯 원인 신뢰도 20/100","📌 판단: 이 경우에만 수급성 움직임 가능성으로 남기며 원인을 억지로 단정하지 않습니다."]
     parts.append("※ 자동 뉴스 원인추정이며 실제 인과는 추가 확인이 필요합니다. 자동주문 없음.")
     return "\n".join(parts)
-
 
 def market_shock_triggered():
     """BTC가 먼저 움직이는 시장충격을 감지. W/K 임계치 도달 전에도 원인분석 알림을 허용."""
@@ -1321,7 +1357,7 @@ def market_cause_worker(direction,cid):
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v12.3 급변 원인분석 테스트】\n\n"
+        "🧪 【v12.4 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
@@ -1704,7 +1740,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v12.3 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v12.4 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
             elif text.startswith("/sellqty"):
                 try:
                     p=text.split(maxsplit=4)
