@@ -1,4 +1,5 @@
 import os, time, threading, requests, json, html
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from collections import deque
 from urllib.parse import quote_plus
@@ -9,6 +10,7 @@ app = Flask(__name__)
 COINS = {"WLD":{"avg":452.0,"qty":192495},"KAIA":{"avg":35.0,"qty":1131289}}
 URL = "https://api.coinone.co.kr/public/v2/ticker_new/KRW"
 SESSION = requests.Session()
+NEWS_HEALTH = {"last_errors":0, "last_ok":0, "last_ts":0.0}
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","").strip()
@@ -115,7 +117,7 @@ STATE = {
 
 load_persistent_state()
 
-# ---------- v12.7 MARKET SHOCK + DEEP CAUSE SEARCH + SAFE REBUY FILTER ----------
+# ---------- v12.8 MARKET SHOCK + DEEP CAUSE SEARCH + SAFE REBUY FILTER ----------
 # BTC는 시장 전체 급변 여부를 판별하기 위한 참고 시세입니다. 자동주문에는 사용하지 않습니다.
 MARKET_HISTORY = {"BTC": deque(maxlen=240)}
 RAPID_LAST = {s:{"ts":0.0,"dir":""} for s in COINS}
@@ -1151,7 +1153,7 @@ def good_radar_text():
 
 def google_news_rss(query, limit=4):
     url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=ko&gl=KR&ceid=KR:ko"
-    r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=(5,12))
+    r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/12.8"}, timeout=(3,6))
     r.raise_for_status()
     root = ET.fromstring(r.content)
     items = []
@@ -1213,7 +1215,7 @@ def _news_age_hours(item):
 
 
 def _macro_news(direction="DOWN"):
-    """v12.7 2단계 심층탐색: 24h 기본검색 실패 시 영어/한국어 세분검색 + 48h 확장."""
+    """v12.8 안정화: 24h→48h 심층검색을 병렬 수행하고 개별 HTTP 실패가 전체 분석을 막지 않게 한다."""
     stage1 = [
         'Bitcoin Federal Reserve chair speech interest rates crypto when:1d',
         'Bitcoin Fed hawkish dovish Treasury yields dollar crypto when:1d',
@@ -1243,19 +1245,37 @@ def _macro_news(direction="DOWN"):
         '비트코인 상승 연준 비둘기 금리인하 ETF 유입 when:2d',
     ]
 
-    def collect(queries, limit=7):
-        out=[]
-        for q in queries:
-            try: out += google_news_rss(q, limit)
-            except Exception: pass
-        return _dedupe_news(out)
+    def one(q, limit=7):
+        try:
+            return google_news_rss(q, limit), None
+        except Exception as e:
+            return [], type(e).__name__
 
-    first=collect(stage1)
+    def collect_parallel(queries, limit=7):
+        out=[]; errors=[]
+        # 요청 수가 많아도 한 번에 4개만 실행해 Google/Render 부담을 제한한다.
+        with ThreadPoolExecutor(max_workers=min(4, len(queries))) as ex:
+            futs=[ex.submit(one,q,limit) for q in queries]
+            for f in as_completed(futs):
+                try:
+                    items,err=f.result()
+                    out.extend(items)
+                    if err: errors.append(err)
+                except Exception as e:
+                    errors.append(type(e).__name__)
+        return _dedupe_news(out), errors
+
+    first, err1=collect_parallel(stage1)
     fresh=[x for x in first if _news_age_hours(x)<=30 or _news_age_hours(x)>=999]
-    # 후보가 빈약하면 즉시 48시간 심층검색을 합친다. 최종 방향성 검증은 랭킹 단계에서 수행.
+    errors=list(err1)
     if len(fresh) < 12:
-        deep=collect(stage2)
+        deep, err2=collect_parallel(stage2)
+        errors.extend(err2)
         fresh=_dedupe_news(fresh + [x for x in deep if _news_age_hours(x)<=54 or _news_age_hours(x)>=999])
+    # 진단용 메타데이터: 호출자는 기사 배열처럼 사용하며 전역 상태로 실패 개수만 참고한다.
+    NEWS_HEALTH["last_errors"]=len(errors)
+    NEWS_HEALTH["last_ok"]=len(fresh)
+    NEWS_HEALTH["last_ts"]=time.time()
     return fresh[:60]
 
 def _macro_category(title):
@@ -1331,7 +1351,7 @@ def _cause_chain(cat, direction):
 
 
 def market_cause_analysis_text(force_direction=None):
-    """v12.7: 24h 기본검색 + 필요 시 48h 심층검색으로 직접 원인을 재탐색한다."""
+    """v12.8: 24h 기본검색 + 필요 시 48h 심층검색으로 직접 원인을 재탐색한다."""
     move=market_move_snapshot(); btc=move.get("BTC",{})
     btc1=btc.get("ret1") or 0.0; btc5=btc.get("ret5") or 0.0
     try:
@@ -1392,7 +1412,10 @@ def market_cause_analysis_text(force_direction=None):
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v12.7】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v12.8】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    if NEWS_HEALTH.get("last_errors",0):
+        parts.append(f"⚠️ 뉴스 연결 일부 지연 {NEWS_HEALTH['last_errors']}건 — 확보 기사 {NEWS_HEALTH.get('last_ok',0)}건으로 계속 분석")
+        parts.append("")
     if selected:
         top=selected[0]; topcat=top[4]
         parts += [f"🥇 1순위 원인 — {topcat}",_cause_chain(topcat,direction),f"🎯 원인 신뢰도 {confidence}/100",""]
@@ -1436,12 +1459,22 @@ def market_cause_worker(direction,cid):
             send_long(market_cause_analysis_text(direction),cid)
     except Exception as e:
         print("[MarketCause] error",repr(e),flush=True)
+        try:
+            m=market_move_snapshot().get("BTC",{})
+            send_long(
+                "⚠️ 【뉴스 연결 지연 — 가격·시장 데이터 분석】\n"
+                f"BTC 1분 {(m.get('ret1') or 0):+.2f}% · 5분 {(m.get('ret5') or 0):+.2f}%\n"
+                "외부 뉴스 조회가 지연되어 이번 회차의 기사 기반 원인 확정은 보류합니다.\n"
+                "가격 감시·장부·재매수 안전필터는 정상 작동합니다.\n"
+                "※ 원인을 억지로 추정하지 않습니다. 자동주문 없음.", cid)
+        except Exception as e2:
+            print("[MarketCauseFallback] error",repr(e2),flush=True)
 
 
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v12.7 급변 원인분석 테스트】\n\n"
+        "🧪 【v12.8 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
@@ -1451,6 +1484,8 @@ def causetest_text():
         "✅ 전망/사전예고 기사 감점 + 실제 발언/발표 우선\n"
         "✅ Reuters/Bloomberg 등 고신뢰 출처 가중\n"
         "✅ 24시간 실패 시 48시간 심층 재검색(한글+영문)\n"
+        "✅ 뉴스 요청 3/6초 timeout + 개별 HTTPError 격리\n"
+        "✅ 최대 4개 병렬검색 + 일부 뉴스 실패 시 확보 기사로 계속 분석\n"
         "✅ ETF/청산/옵션/나스닥 위험자산 동조 보조탐색\n"
         "✅ 원인 미확인 시 억지 추정 금지\n\n"
         "※ 가상 테스트이며 가격·평단·수량·현금·장부는 변경하지 않습니다."
