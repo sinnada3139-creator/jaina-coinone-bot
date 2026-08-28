@@ -115,7 +115,7 @@ STATE = {
 
 load_persistent_state()
 
-# ---------- v12.6 MARKET SHOCK + DIRECTION-VALIDATED CAUSE ENGINE + SAFE REBUY FILTER ----------
+# ---------- v12.7 MARKET SHOCK + DEEP CAUSE SEARCH + SAFE REBUY FILTER ----------
 # BTC는 시장 전체 급변 여부를 판별하기 위한 참고 시세입니다. 자동주문에는 사용하지 않습니다.
 MARKET_HISTORY = {"BTC": deque(maxlen=240)}
 RAPID_LAST = {s:{"ts":0.0,"dir":""} for s in COINS}
@@ -1213,8 +1213,8 @@ def _news_age_hours(item):
 
 
 def _macro_news(direction="DOWN"):
-    """최근 24시간 거시·수급 원인을 여러 축으로 따로 검색해 한 검색어 누락을 줄인다."""
-    common = [
+    """v12.7 2단계 심층탐색: 24h 기본검색 실패 시 영어/한국어 세분검색 + 48h 확장."""
+    stage1 = [
         'Bitcoin Federal Reserve chair speech interest rates crypto when:1d',
         'Bitcoin Fed hawkish dovish Treasury yields dollar crypto when:1d',
         'Bitcoin inflation PCE CPI jobs payroll crypto market when:1d',
@@ -1224,20 +1224,39 @@ def _macro_news(direction="DOWN"):
         '비트코인 청산 ETF 유출 옵션 만기 규제 해킹 when:1d',
     ]
     if direction == "UP":
-        common += ['Bitcoin crypto rally rate cut dovish ETF inflow rebound when:1d']
+        stage1 += ['Bitcoin crypto rally rate cut dovish ETF inflow rebound when:1d']
     else:
-        common += ['Bitcoin crypto selloff rate hike hawkish yields dollar liquidation when:1d']
-    items=[]
-    for q in common:
-        try:
-            items += google_news_rss(q, 6)
-        except Exception:
-            pass
-    # 실제 최근 기사만 남기되 RSS 시각 파싱 실패 기사는 후보로 유지한다.
-    dedup=_dedupe_news(items)
-    fresh=[x for x in dedup if _news_age_hours(x)<=30 or _news_age_hours(x)>=999]
-    return fresh[:30]
+        stage1 += ['Bitcoin crypto selloff rate hike hawkish yields dollar liquidation when:1d']
 
+    stage2 = [
+        'Bitcoin falls Fed chair rate hike Treasury yields dollar when:2d',
+        'Bitcoin drops Jackson Hole Fed speech hawkish when:2d',
+        'Bitcoin crypto liquidations long positions options expiry when:2d',
+        'Bitcoin ETF outflows spot ETF flows when:2d',
+        'Bitcoin Nasdaq risk assets selloff yields dollar when:2d',
+        '비트코인 하락 연준 매파 금리인상 국채금리 달러강세 when:2d',
+        '비트코인 급락 롱 청산 옵션 만기 ETF 유출 when:2d',
+    ] if direction == "DOWN" else [
+        'Bitcoin rises Fed dovish rate cut Treasury yields dollar when:2d',
+        'Bitcoin rally ETF inflows short liquidation when:2d',
+        'Bitcoin Nasdaq risk assets rally yields dollar when:2d',
+        '비트코인 상승 연준 비둘기 금리인하 ETF 유입 when:2d',
+    ]
+
+    def collect(queries, limit=7):
+        out=[]
+        for q in queries:
+            try: out += google_news_rss(q, limit)
+            except Exception: pass
+        return _dedupe_news(out)
+
+    first=collect(stage1)
+    fresh=[x for x in first if _news_age_hours(x)<=30 or _news_age_hours(x)>=999]
+    # 후보가 빈약하면 즉시 48시간 심층검색을 합친다. 최종 방향성 검증은 랭킹 단계에서 수행.
+    if len(fresh) < 12:
+        deep=collect(stage2)
+        fresh=_dedupe_news(fresh + [x for x in deep if _news_age_hours(x)<=54 or _news_age_hours(x)>=999])
+    return fresh[:60]
 
 def _macro_category(title):
     low=(title or "").lower()
@@ -1312,7 +1331,7 @@ def _cause_chain(cat, direction):
 
 
 def market_cause_analysis_text(force_direction=None):
-    """v12.6: v12.5 원인분석을 유지하고 재매수 안전필터를 추가한다."""
+    """v12.7: 24h 기본검색 + 필요 시 48h 심층검색으로 직접 원인을 재탐색한다."""
     move=market_move_snapshot(); btc=move.get("BTC",{})
     btc1=btc.get("ret1") or 0.0; btc5=btc.get("ret5") or 0.0
     try:
@@ -1373,7 +1392,7 @@ def market_cause_analysis_text(force_direction=None):
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v12.6】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v12.7】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if selected:
         top=selected[0]; topcat=top[4]
         parts += [f"🥇 1순위 원인 — {topcat}",_cause_chain(topcat,direction),f"🎯 원인 신뢰도 {confidence}/100",""]
@@ -1390,7 +1409,7 @@ def market_cause_analysis_text(force_direction=None):
         parts.append(f"\n✅ 반대방향 제목 {rejected_opposite}건 자동 제외")
         parts.append("📌 판단: 가격 방향·발행시각·실제 사건성·출처 품질을 함께 검증했습니다. 전망성 기사는 감점합니다.")
     else:
-        parts += ["🔎 최근 24시간까지 검색했지만 가격 방향과 시간대가 함께 맞는 직접 근거를 확인하지 못했습니다.","🎯 원인 신뢰도 20/100",f"✅ 반대방향 제목 {rejected_opposite}건 자동 제외","📌 판단: 방향이 반대인 기사나 단순 전망 기사로 원인을 억지로 만들지 않습니다."]
+        parts += ["🔎 24시간 기본검색과 48시간 심층검색까지 수행했지만 가격 방향과 시간대가 함께 맞는 직접 근거를 확인하지 못했습니다.","🎯 원인 신뢰도 20/100",f"✅ 반대방향 제목 {rejected_opposite}건 자동 제외","📌 판단: 방향이 반대인 기사나 단순 전망 기사로 원인을 억지로 만들지 않습니다."]
     parts.append("※ 자동 뉴스 원인추정이며 실제 인과는 추가 확인이 필요합니다. 자동주문 없음.")
     return "\n".join(parts)
 
@@ -1422,7 +1441,7 @@ def market_cause_worker(direction,cid):
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v12.6 급변 원인분석 테스트】\n\n"
+        "🧪 【v12.7 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
@@ -1431,6 +1450,8 @@ def causetest_text():
         "✅ 가격과 반대방향 기사 자동 제외\n"
         "✅ 전망/사전예고 기사 감점 + 실제 발언/발표 우선\n"
         "✅ Reuters/Bloomberg 등 고신뢰 출처 가중\n"
+        "✅ 24시간 실패 시 48시간 심층 재검색(한글+영문)\n"
+        "✅ ETF/청산/옵션/나스닥 위험자산 동조 보조탐색\n"
         "✅ 원인 미확인 시 억지 추정 금지\n\n"
         "※ 가상 테스트이며 가격·평단·수량·현금·장부는 변경하지 않습니다."
     )
