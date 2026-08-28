@@ -1229,7 +1229,7 @@ def _news_cache_put(query, items):
 MACRO_EVIDENCE_KEY = "__macro_evidence_pool_v135__"
 
 def _macro_pool_get(limit=80):
-    """v13.5: 검색어와 무관하게 최근 성공한 거시/크립토 기사를 재사용하는 영구 증거풀."""
+    """v13.6: 검색어와 무관하게 최근 성공한 거시/크립토 기사를 재사용하는 영구 증거풀."""
     return _news_cache_get(MACRO_EVIDENCE_KEY, limit, True)
 
 def _macro_pool_put(items):
@@ -1269,7 +1269,7 @@ def bing_news_rss(query, limit=6):
     key="bing::"+query
     try:
         url="https://www.bing.com/news/search?q="+quote_plus(query)+"&format=rss&mkt=en-US"
-        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.5"},timeout=(2.5,5.0))
+        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.6"},timeout=(2.5,5.0))
         r.raise_for_status()
         items=_parse_rss_items(r.content,limit,"Bing News")
         _news_cache_put(key,items)
@@ -1285,14 +1285,14 @@ def direct_crypto_feeds(limit=10):
     feeds=[
         ("CoinDesk","https://www.coindesk.com/arc/outboundfeeds/rss/"),
         ("CNBC","https://www.cnbc.com/id/10000664/device/rss/rss.html"),
-        # v13.5: 검색엔진 장애와 독립된 추가 금융 피드. 실패해도 다른 피드는 계속 동작.
+        # v13.6: 검색엔진 장애와 독립된 추가 금융 피드. 실패해도 다른 피드는 계속 동작.
         ("CNBC Markets","https://www.cnbc.com/id/100003114/device/rss/rss.html"),
     ]
     out=[]
     for source,url in feeds:
         key="feed::"+source
         try:
-            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.5"},timeout=(2.5,5.0))
+            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.6"},timeout=(2.5,5.0))
             r.raise_for_status()
             items=_parse_rss_items(r.content,limit,source)
             _news_cache_put(key,items)
@@ -1328,7 +1328,7 @@ def google_news_rss(query, limit=4, priority=False):
         raise requests.exceptions.ReadTimeout("news circuit open")
     url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=ko&gl=KR&ceid=KR:ko"
     try:
-        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.5"}, timeout=(2.5,4.5))
+        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.6"}, timeout=(2.5,4.5))
         r.raise_for_status()
         root = ET.fromstring(r.content)
         items = []
@@ -1448,19 +1448,29 @@ def _macro_news(direction="DOWN"):
                     errors.append(type(e).__name__)
         return _dedupe_news(out), errors
 
-    first, err1=collect_parallel(stage1)
-    # 검색엔진과 독립된 직접 피드를 합쳐 단일 공급자 장애를 피한다.
+    # v13.6: 검색엔진보다 직접 RSS와 영구 캐시를 먼저 사용한다.
+    # Render에서 Bing/Google이 느릴 때 /cause 호출마다 다수의 timeout을 만드는 문제를 줄인다.
+    first=[]; err1=[]
     try:
-        first=_dedupe_news(first + direct_crypto_feeds(16))
+        first=_dedupe_news(direct_crypto_feeds(20) + _macro_pool_get(80))
     except Exception:
-        pass
-    # v13.5 핵심: 현재 요청들이 timeout이어도 이전에 성공한 모든 거시 증거를
+        first=_dedupe_news(_macro_pool_get(80))
+
+    # 직접 근거가 충분하지 않을 때만 핵심 검색어 2개를 우선 조회한다.
+    # 전체 검색어 폭탄 대신 짧은 1차 보강 후 필요할 때만 심층검색한다.
+    fresh0=[x for x in first if _news_age_hours(x)<=30 or _news_age_hours(x)>=999]
+    if len(fresh0) < 12:
+        urgent = stage1[-2:] if direction == "DOWN" else stage1[-1:] + stage1[:1]
+        searched, err1=collect_parallel(urgent, limit=8)
+        first=_dedupe_news(first + searched)
+
+    # v13.6 핵심: 현재 요청들이 timeout이어도 이전에 성공한 모든 거시 증거를
     # 검색어별 캐시와 별개인 영구 풀에서 병합한다. Render 재시작 후에도 복원됨.
     first=_dedupe_news(first + _macro_pool_get(80))
     fresh=[x for x in first if _news_age_hours(x)<=30 or _news_age_hours(x)>=999]
     errors=list(err1)
-    if len(fresh) < 12:
-        deep, err2=collect_parallel(stage2)
+    if len(fresh) < 8:
+        deep, err2=collect_parallel(stage2[:3], limit=8)
         errors.extend(err2)
         fresh=_dedupe_news(fresh + [x for x in deep if _news_age_hours(x)<=54 or _news_age_hours(x)>=999])
     # 성공한 결과는 즉시 전역 영구 증거풀에도 축적한다. 다음 timeout 회차의 보험.
@@ -1589,7 +1599,7 @@ def _v133_stale_btc_price_title(title, btc_krw):
     return False, ""
 
 def market_cause_analysis_text(force_direction=None):
-    """v13.5: 실시간 검색 실패 시에도 영구 거시 증거풀을 병합해 직접 원인을 최대한 복원한다."""
+    """v13.6: 실시간 검색 실패 시에도 영구 거시 증거풀을 병합해 직접 원인을 최대한 복원한다."""
     move=market_move_snapshot(); btc=move.get("BTC",{})
     btc1=btc.get("ret1") or 0.0; btc5=btc.get("ret5") or 0.0
     try:
@@ -1665,7 +1675,7 @@ def market_cause_analysis_text(force_direction=None):
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v13.5】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v13.6】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if NEWS_HEALTH.get("last_errors",0):
         parts.append(f"⚠️ 뉴스 연결 일부 지연 {NEWS_HEALTH['last_errors']}건 — 확보 기사 {NEWS_HEALTH.get('last_ok',0)}건으로 계속 분석")
         parts.append("")
@@ -1733,7 +1743,7 @@ def market_cause_worker(direction,cid):
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v13.5 급변 원인분석 테스트】\n\n"
+        "🧪 【v13.6 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
