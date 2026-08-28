@@ -1203,7 +1203,7 @@ def bing_news_rss(query, limit=6):
     key="bing::"+query
     try:
         url="https://www.bing.com/news/search?q="+quote_plus(query)+"&format=rss&mkt=en-US"
-        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.0"},timeout=(2.5,5.0))
+        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.1"},timeout=(2.5,5.0))
         r.raise_for_status()
         items=_parse_rss_items(r.content,limit,"Bing News")
         _news_cache_put(key,items)
@@ -1224,7 +1224,7 @@ def direct_crypto_feeds(limit=10):
     for source,url in feeds:
         key="feed::"+source
         try:
-            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.0"},timeout=(2.5,5.0))
+            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.1"},timeout=(2.5,5.0))
             r.raise_for_status()
             items=_parse_rss_items(r.content,limit,source)
             _news_cache_put(key,items)
@@ -1259,7 +1259,7 @@ def google_news_rss(query, limit=4, priority=False):
         raise requests.exceptions.ReadTimeout("news circuit open")
     url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=ko&gl=KR&ceid=KR:ko"
     try:
-        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.0"}, timeout=(2.5,4.5))
+        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.1"}, timeout=(2.5,4.5))
         r.raise_for_status()
         root = ET.fromstring(r.content)
         items = []
@@ -1399,9 +1399,13 @@ def _macro_news(direction="DOWN"):
 
 def _macro_category(title):
     low=(title or "").lower()
+    # v13.1: 프로젝트 토큰경제의 inflation/disinflation을 미국 거시 물가로 오인하지 않는다.
+    us_macro_anchor=("cpi","pce","consumer price","producer price","ppi","payroll","nonfarm","jobs report","jobless","unemployment","labor market","bls","bureau of labor statistics","미 소비자물가","미국 물가","고용보고서","비농업","실업률","미 노동부")
+    tokenomics_context=("solana","ethereum","tokenomics","token supply","issuance","emission","burn rate","validator","staking","disinflation proposal","inflation proposal","토큰","발행량","소각","스테이킹")
+    if any(w in low for w in us_macro_anchor) and not any(w in low for w in tokenomics_context):
+        return "미국 물가·고용"
     groups=[
         ("연준·금리", ("fed","federal reserve","powell","warsh","hawkish","dovish","rate hike","rate cut","interest rate","연준","금리","매파","비둘기파")),
-        ("미국 물가·고용", ("inflation","cpi","pce","payroll","jobs","unemployment","물가","고용","실업")),
         ("달러·국채금리", ("treasury","yield","bond yield","dollar","dxy","국채","국채금리","달러")),
         ("ETF 자금", ("etf","inflow","outflow","spot bitcoin etf","ETF","유입","유출")),
         ("레버리지·옵션", ("liquidation","liquidated","leverage","options expiry","option expiry","청산","레버리지","옵션 만기")),
@@ -1413,6 +1417,21 @@ def _macro_category(title):
         if any(w in low for w in words): return name
     return "시장 수급·기타"
 
+
+def _category_support_score(title, cat):
+    """v13.1: 제목이 해당 원인 카테고리를 실제로 뒷받침하는 정도. 약한 키워드 우연 일치를 차단."""
+    low=(title or "").lower()
+    anchors={
+        "연준·금리": ("fed","federal reserve","warsh","powell","rate hike","rate cut","interest rate","hawkish","dovish","연준","금리","매파","비둘기파"),
+        "미국 물가·고용": ("cpi","pce","ppi","consumer price","payroll","nonfarm","jobs report","jobless","unemployment","labor market","bls","미국 물가","소비자물가","고용보고서","비농업","실업률"),
+        "달러·국채금리": ("treasury","yield","bond yield","dollar","dxy","국채","국채금리","달러"),
+        "ETF 자금": ("bitcoin etf","spot bitcoin etf","btc etf","etf inflow","etf outflow","ETF 유입","ETF 유출","현물 ETF"),
+        "레버리지·옵션": ("liquidation","liquidated","leverage","options expiry","option expiry","청산","레버리지","옵션 만기"),
+        "규제·법률": ("regulation","regulator","sec ","clarity act","lawsuit","ban","규제","당국","소송","금지"),
+        "해킹·보안": ("hack","exploit","breach","해킹","익스플로잇","보안"),
+        "지정학·관세": ("war ","conflict","tariff","geopolitical","전쟁","분쟁","관세","지정학"),
+    }
+    return sum(1 for w in anchors.get(cat,()) if w in low)
 
 def _macro_direction_score(title, direction):
     low=(title or "").lower()
@@ -1470,7 +1489,7 @@ def _cause_chain(cat, direction):
 
 
 def market_cause_analysis_text(force_direction=None):
-    """v13.0: 다중 뉴스 경로 + 24h/48h 심층검색으로 직접 원인을 재탐색한다."""
+    """v13.1: 다중 뉴스 경로를 유지하면서 거시 카테고리 오분류와 약한 보조원인을 차단한다."""
     move=market_move_snapshot(); btc=move.get("BTC",{})
     btc1=btc.get("ret1") or 0.0; btc5=btc.get("ret5") or 0.0
     try:
@@ -1498,25 +1517,34 @@ def market_cause_analysis_text(force_direction=None):
             rejected_opposite += 1
             continue
         freshness=5 if age<=6 else (4 if age<=12 else (2 if age<=24 else 0))
-        relevance=3 if cat!="시장 수급·기타" else 0
+        catsupport=_category_support_score(title,cat)
+        relevance=3 if cat!="시장 수급·기타" and catsupport>0 else 0
         sourceq=_source_quality(it.get("source"))
         direct=_direct_event_score(title,cat)
         forecast_penalty=5 if _is_forecast_or_preview(title) else 0
         direction_bonus=5 if polarity==expected else 0
-        total=ds*3 + sourceq*2 + freshness + relevance + direct*2 + direction_bonus - forecast_penalty
+        total=ds*3 + sourceq*2 + freshness + relevance + direct*2 + direction_bonus + min(catsupport,2)*2 - forecast_penalty
+        # v13.1: 카테고리 핵심근거가 없는 기사(예: Solana disinflation)는 원인 후보에서 제외.
+        if cat!="시장 수급·기타" and catsupport<=0:
+            continue
         # 전망성 기사 단독 또는 방향성 없는 약한 기사는 1순위 원인으로 올라오지 못하게 문턱 강화.
         if total>=10 and (ds>0 or direct>=2):
-            ranked.append((total,ds,sourceq,freshness,cat,age,it,direct,forecast_penalty,polarity))
+            ranked.append((total,ds,sourceq,freshness,cat,age,it,direct,forecast_penalty,polarity,catsupport))
     ranked.sort(key=lambda x:(x[0],x[2],x[7],-x[5]),reverse=True)
 
     selected=[]; seen_cats=set()
-    for row in ranked:
-        if row[4] not in seen_cats:
-            selected.append(row); seen_cats.add(row[4])
-        if len(selected)>=3: break
-    if len(selected)<3:
-        for row in ranked:
-            if row not in selected: selected.append(row)
+    if ranked:
+        # 1순위는 가장 강한 직접 근거.
+        selected.append(ranked[0]); seen_cats.add(ranked[0][4])
+        top_score=ranked[0][0]
+        # 보조원인은 독립 카테고리 + 충분한 사건성/방향성 + 1순위와 지나치게 동떨어지지 않은 경우만 채택.
+        for row in ranked[1:]:
+            cat=row[4]; total=row[0]; ds=row[1]; direct=row[7]; forecast=row[8]; catsupport=row[10]
+            if cat in seen_cats or cat=="시장 수급·기타":
+                continue
+            strong_aux=(catsupport>0 and not forecast and total>=14 and total>=top_score*0.55 and (ds>0 or direct>=2))
+            if strong_aux:
+                selected.append(row); seen_cats.add(cat)
             if len(selected)>=3: break
 
     confidence=20
@@ -1531,7 +1559,7 @@ def market_cause_analysis_text(force_direction=None):
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v13.0】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v13.1】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if NEWS_HEALTH.get("last_errors",0):
         parts.append(f"⚠️ 뉴스 연결 일부 지연 {NEWS_HEALTH['last_errors']}건 — 확보 기사 {NEWS_HEALTH.get('last_ok',0)}건으로 계속 분석")
         parts.append("")
@@ -1541,9 +1569,11 @@ def market_cause_analysis_text(force_direction=None):
         if len(selected)>1:
             parts.append("🔎 보조 원인/변동성 확대 요인")
             for i,row in enumerate(selected[1:3],2): parts.append(f"{i}순위 {row[4]} — {_cause_chain(row[4],direction)}")
+        else:
+            parts.append("🔎 확인된 보조원인 없음 — 약한 연관 기사로 순위를 억지로 채우지 않습니다.")
         parts.append("\n📰 기사 근거 · 방향/시간 검증")
         for row in selected[:3]:
-            _,_,sourceq,_,cat,age,it,direct,forecast_penalty,polarity=row
+            _,_,sourceq,_,cat,age,it,direct,forecast_penalty,polarity,catsupport=row
             src=f" · {it.get('source')}" if it.get('source') else ""
             age_txt=f"약 {age:.1f}시간 전" if age<100 else "발행시각 확인불가"
             kind="실제 사건/발언" if direct>=2 and not forecast_penalty else ("전망성 기사" if forecast_penalty else "관련 기사")
@@ -1596,7 +1626,7 @@ def market_cause_worker(direction,cid):
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v13.0 급변 원인분석 테스트】\n\n"
+        "🧪 【v13.1 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
