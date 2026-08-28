@@ -16,6 +16,8 @@ NEWS_CACHE_LOCK = threading.RLock()
 NEWS_PRIORITY = threading.Event()
 NEWS_CACHE_TTL = 6 * 3600
 NEWS_STALE_TTL = 48 * 3600
+NEWS_CACHE_LAST_DISK_SAVE = 0.0
+NEWS_CACHE_DISK_SAVE_INTERVAL = 60
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","").strip()
@@ -43,6 +45,22 @@ def load_persistent_state():
         if saved_chat:
             CHAT_ID = saved_chat
         saved_ledger = saved.get("_ledger", {}) or {}
+
+        # v13.4: restore successful news cache from persistent disk.
+        # This survives Render restart/redeploy when /var/data is a Persistent Disk.
+        saved_news_cache = saved.get("_news_cache", {}) or {}
+        now_ts = time.time()
+        with NEWS_CACHE_LOCK:
+            NEWS_CACHE.clear()
+            for key, row in saved_news_cache.items():
+                try:
+                    ts = float((row or {}).get("ts", 0) or 0)
+                    items = list((row or {}).get("items", []) or [])[:12]
+                    if ts > 0 and (now_ts - ts) <= NEWS_STALE_TTL and items:
+                        NEWS_CACHE[str(key)] = {"ts": ts, "items": items}
+                except Exception:
+                    continue
+
         with LOCK:
             for symbol in COINS:
                 if symbol in saved_ledger:
@@ -92,6 +110,26 @@ def save_persistent_state():
                     "last_alert_ts": float(st.get("last_alert_ts", 0.0) or 0.0),
                     "saved_at": int(time.time()),
                 }
+
+        # v13.4: persist only recent successful news entries.
+        # Snapshot outside the trading LOCK to avoid coupling market state and news I/O.
+        with NEWS_CACHE_LOCK:
+            now_ts = time.time()
+            news_snapshot = {}
+            for key, row in NEWS_CACHE.items():
+                try:
+                    ts = float((row or {}).get("ts", 0) or 0)
+                    items = list((row or {}).get("items", []) or [])[:12]
+                    if ts > 0 and (now_ts - ts) <= NEWS_STALE_TTL and items:
+                        news_snapshot[str(key)] = {"ts": ts, "items": items}
+                except Exception:
+                    continue
+            # Bound disk size.
+            if len(news_snapshot) > 120:
+                newest = sorted(news_snapshot.items(), key=lambda kv: kv[1].get("ts", 0), reverse=True)[:120]
+                news_snapshot = dict(newest)
+        data["_news_cache"] = news_snapshot
+
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1156,6 +1194,19 @@ def good_radar_text():
     return "\n".join(parts)
 
 
+def _persist_news_cache_debounced():
+    """v13.4: successful news survives Render restart/redeploy."""
+    global NEWS_CACHE_LAST_DISK_SAVE
+    now = time.time()
+    if now - NEWS_CACHE_LAST_DISK_SAVE < NEWS_CACHE_DISK_SAVE_INTERVAL:
+        return
+    NEWS_CACHE_LAST_DISK_SAVE = now
+    try:
+        save_persistent_state()
+    except Exception as e:
+        print("[NewsCache] persistent save error", e, flush=True)
+
+
 def _news_cache_get(query, limit=4, allow_stale=True):
     with NEWS_CACHE_LOCK:
         row=NEWS_CACHE.get(query)
@@ -1173,6 +1224,7 @@ def _news_cache_put(query, items):
         if len(NEWS_CACHE)>120:
             for k,_ in sorted(NEWS_CACHE.items(), key=lambda kv:kv[1].get("ts",0))[:20]:
                 NEWS_CACHE.pop(k,None)
+    _persist_news_cache_debounced()
 
 def _parse_rss_items(content, limit=6, forced_source=""):
     """RSS/Atom을 공통 형식으로 변환. 개별 피드 오류는 빈 배열로 격리."""
@@ -1203,7 +1255,7 @@ def bing_news_rss(query, limit=6):
     key="bing::"+query
     try:
         url="https://www.bing.com/news/search?q="+quote_plus(query)+"&format=rss&mkt=en-US"
-        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.3"},timeout=(2.5,5.0))
+        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.4"},timeout=(2.5,5.0))
         r.raise_for_status()
         items=_parse_rss_items(r.content,limit,"Bing News")
         _news_cache_put(key,items)
@@ -1224,7 +1276,7 @@ def direct_crypto_feeds(limit=10):
     for source,url in feeds:
         key="feed::"+source
         try:
-            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.3"},timeout=(2.5,5.0))
+            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.4"},timeout=(2.5,5.0))
             r.raise_for_status()
             items=_parse_rss_items(r.content,limit,source)
             _news_cache_put(key,items)
@@ -1259,7 +1311,7 @@ def google_news_rss(query, limit=4, priority=False):
         raise requests.exceptions.ReadTimeout("news circuit open")
     url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=ko&gl=KR&ceid=KR:ko"
     try:
-        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.3"}, timeout=(2.5,4.5))
+        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.4"}, timeout=(2.5,4.5))
         r.raise_for_status()
         root = ET.fromstring(r.content)
         items = []
@@ -1399,7 +1451,7 @@ def _macro_news(direction="DOWN"):
 
 def _macro_category(title):
     low=(title or "").lower()
-    # v13.3: 프로젝트 토큰경제의 inflation/disinflation을 미국 거시 물가로 오인하지 않는다.
+    # v13.4: 프로젝트 토큰경제의 inflation/disinflation을 미국 거시 물가로 오인하지 않는다.
     us_macro_anchor=("cpi","pce","consumer price","producer price","ppi","payroll","nonfarm","jobs report","jobless","unemployment","labor market","bls","bureau of labor statistics","미 소비자물가","미국 물가","고용보고서","비농업","실업률","미 노동부")
     tokenomics_context=("solana","ethereum","tokenomics","token supply","issuance","emission","burn rate","validator","staking","disinflation proposal","inflation proposal","토큰","발행량","소각","스테이킹")
     if any(w in low for w in us_macro_anchor) and not any(w in low for w in tokenomics_context):
@@ -1419,7 +1471,7 @@ def _macro_category(title):
 
 
 def _category_support_score(title, cat):
-    """v13.3: 제목이 해당 원인 카테고리를 실제로 뒷받침하는 정도. 약한 키워드 우연 일치를 차단."""
+    """v13.4: 제목이 해당 원인 카테고리를 실제로 뒷받침하는 정도. 약한 키워드 우연 일치를 차단."""
     low=(title or "").lower()
     anchors={
         "연준·금리": ("fed","federal reserve","warsh","powell","rate hike","rate cut","interest rate","hawkish","dovish","연준","금리","매파","비둘기파"),
@@ -1514,7 +1566,7 @@ def _v133_stale_btc_price_title(title, btc_krw):
     return False, ""
 
 def market_cause_analysis_text(force_direction=None):
-    """v13.3: 다중 뉴스 경로를 유지하면서 거시 카테고리 오분류와 약한 보조원인을 차단한다."""
+    """v13.4: 다중 뉴스 경로를 유지하면서 거시 카테고리 오분류와 약한 보조원인을 차단한다."""
     move=market_move_snapshot(); btc=move.get("BTC",{})
     btc1=btc.get("ret1") or 0.0; btc5=btc.get("ret5") or 0.0
     try:
@@ -1541,7 +1593,7 @@ def market_cause_analysis_text(force_direction=None):
         if polarity and polarity != expected:
             rejected_opposite += 1
             continue
-        # v13.3 minimal guard: do not reject undated articles; only reject an
+        # v13.4 minimal guard: do not reject undated articles; only reject an
         # explicit BTC price in the headline when it is obviously far from current BTC.
         stale_price, stale_ref = _v133_stale_btc_price_title(title, btcprice)
         if stale_price:
@@ -1555,7 +1607,7 @@ def market_cause_analysis_text(force_direction=None):
         forecast_penalty=5 if _is_forecast_or_preview(title) else 0
         direction_bonus=5 if polarity==expected else 0
         total=ds*3 + sourceq*2 + freshness + relevance + direct*2 + direction_bonus + min(catsupport,2)*2 - forecast_penalty
-        # v13.3: 카테고리 핵심근거가 없는 기사(예: Solana disinflation)는 원인 후보에서 제외.
+        # v13.4: 카테고리 핵심근거가 없는 기사(예: Solana disinflation)는 원인 후보에서 제외.
         if cat!="시장 수급·기타" and catsupport<=0:
             continue
         # 전망성 기사 단독 또는 방향성 없는 약한 기사는 1순위 원인으로 올라오지 못하게 문턱 강화.
@@ -1590,7 +1642,7 @@ def market_cause_analysis_text(force_direction=None):
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v13.3】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v13.4】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if NEWS_HEALTH.get("last_errors",0):
         parts.append(f"⚠️ 뉴스 연결 일부 지연 {NEWS_HEALTH['last_errors']}건 — 확보 기사 {NEWS_HEALTH.get('last_ok',0)}건으로 계속 분석")
         parts.append("")
@@ -1658,7 +1710,7 @@ def market_cause_worker(direction,cid):
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v13.3 급변 원인분석 테스트】\n\n"
+        "🧪 【v13.4 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
@@ -1675,7 +1727,9 @@ def causetest_text():
         "✅ ETF/청산/옵션/나스닥 위험자산 동조 보조탐색\n"
         "✅ 원인 미확인 시 억지 추정 금지\n"
         "✅ 발행시각 미확인만으로 기사 제외하지 않음\n"
-        "✅ 현재 BTC 가격대와 크게 다른 명시가격 기사만 제외\n\n"
+        "✅ 현재 BTC 가격대와 크게 다른 명시가격 기사만 제외\n"
+        "✅ 성공 뉴스 /var/data 영구 캐시 저장\n"
+        "✅ Render 재시작·재배포 후 48시간 캐시 복원\n\n"
         "※ 가상 테스트이며 가격·평단·수량·현금·장부는 변경하지 않습니다."
     )
 
