@@ -115,7 +115,7 @@ STATE = {
 
 load_persistent_state()
 
-# ---------- v12.5 MARKET SHOCK + DIRECTION-VALIDATED CAUSE ENGINE ----------
+# ---------- v12.6 MARKET SHOCK + DIRECTION-VALIDATED CAUSE ENGINE + SAFE REBUY FILTER ----------
 # BTC는 시장 전체 급변 여부를 판별하기 위한 참고 시세입니다. 자동주문에는 사용하지 않습니다.
 MARKET_HISTORY = {"BTC": deque(maxlen=240)}
 RAPID_LAST = {s:{"ts":0.0,"dir":""} for s in COINS}
@@ -628,13 +628,26 @@ def strategy(symbol, tick):
             rebuy_note="뉴스/시장 급락 원인 확인"
             reason=f"고점대비 {price_dd:.1f}%"
 
-        # 1) 황금구간: 충분한 조정 후 하락세가 둔화/반전되고 거래량이 과열되지 않은 구간
-        elif -18 < price_dd <= -10 and ret1 >= 0 and ret5 >= -0.5 and vol_ratio <= 1.3:
+        # 1) v12.6 재매수 안전필터: 단순 낙폭만으로 황금구간을 선언하지 않는다.
+        # 추세점수, 15분 MACD/EMA, 당일 급락 진정 여부까지 확인한다.
+        elif -18 < price_dd <= -10 and trend.get("ready") and (
+            trend.get("score",0) < 45
+            or not trend.get("short",{}).get("macd_bull",False)
+            or not trend.get("short",{}).get("ema_bull",False)
+            or (daily.get("ready") and daily.get("today_change_pct",0) <= -5.0)
+        ):
+            signal="🔴 하락추세 · 바닥 확인 전 재매수 보류"
+            phase="재매수보류"
+            protect_action="추가 매수 보류 · 15분 추세 반전 확인"
+            rebuy_note="EMA20/60·MACD·당일 급락이 안정된 뒤 재평가"
+            reason=f"고점대비 {price_dd:.1f}% · 추세 {trend.get('score',0)}/100 · 오늘09시 {daily.get('today_change_pct',0):+.2f}%"
+
+        elif -18 < price_dd <= -10 and ret1 >= 0 and ret5 >= -0.5 and vol_ratio <= 1.3 and trend.get("ready") and trend.get("score",0) >= 60 and trend.get("short",{}).get("macd_bull",False) and trend.get("short",{}).get("ema_bull",False) and (not daily.get("ready") or daily.get("today_change_pct",0) > -5.0):
             signal="⭐ 황금구간 · 재매수 최우선 후보"
             phase="황금구간"
             protect_action="익절금의 20~30% 재매수 검토"
             rebuy_note="추가 하락 대비 남은 익절금은 반드시 보유"
-            reason=f"고점대비 {price_dd:.1f}% · 1분 {ret1:+.2f}% · 5분 {ret5:+.2f}% · 거래량 {vol_ratio:.2f}배"
+            reason=f"고점대비 {price_dd:.1f}% · 추세 {trend.get('score',0)}/100 · 1분 {ret1:+.2f}% · 5분 {ret5:+.2f}% · 거래량 {vol_ratio:.2f}배"
 
         # 2) 급등 과열: 준비와 실행을 분리
         elif score>=5 and price_dd>-2:
@@ -734,6 +747,13 @@ def strategy(symbol, tick):
                 trend_note="과열 신호이나 상승추세 강함 — 전량매도보다 분할익절 관점"
         else:
             trend_note="추세지표 데이터 확인중 — 기존 보호신호 기준 유지"
+
+        # v12.6: 재매수 신호는 유지하되 실제 장부 현금이 없으면 행동지침을 안전하게 제한한다.
+        if phase in ("황금구간","재매수실행","실행준비","준비") and ("재매수" in signal or "황금구간" in signal):
+            cash_now=float(LEDGER[symbol].get("cash",0.0) or 0.0)
+            if cash_now < 1000:
+                protect_action="재매수 후보 감시 — 현재 장부 재매수 가능 현금 없음"
+                rebuy_note="신호만 추적 · 신규 현금 투입 권고 아님"
 
         st["signal"]=signal
         st["score"]=score
@@ -1292,7 +1312,7 @@ def _cause_chain(cat, direction):
 
 
 def market_cause_analysis_text(force_direction=None):
-    """v12.5: 24시간 뉴스 + 가격방향 일치 + 실제 사건성 + 출처 품질을 검증한다."""
+    """v12.6: v12.5 원인분석을 유지하고 재매수 안전필터를 추가한다."""
     move=market_move_snapshot(); btc=move.get("BTC",{})
     btc1=btc.get("ret1") or 0.0; btc5=btc.get("ret5") or 0.0
     try:
@@ -1353,7 +1373,7 @@ def market_cause_analysis_text(force_direction=None):
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v12.5】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v12.6】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if selected:
         top=selected[0]; topcat=top[4]
         parts += [f"🥇 1순위 원인 — {topcat}",_cause_chain(topcat,direction),f"🎯 원인 신뢰도 {confidence}/100",""]
@@ -1402,7 +1422,7 @@ def market_cause_worker(direction,cid):
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v12.5 급변 원인분석 테스트】\n\n"
+        "🧪 【v12.6 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
