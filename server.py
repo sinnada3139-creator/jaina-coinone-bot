@@ -1229,7 +1229,7 @@ def _news_cache_put(query, items):
 MACRO_EVIDENCE_KEY = "__macro_evidence_pool_v135__"
 
 def _macro_pool_get(limit=80):
-    """v13.6: 검색어와 무관하게 최근 성공한 거시/크립토 기사를 재사용하는 영구 증거풀."""
+    """v13.7: 검색어와 무관하게 최근 성공한 거시/크립토 기사를 재사용하는 영구 증거풀."""
     return _news_cache_get(MACRO_EVIDENCE_KEY, limit, True)
 
 def _macro_pool_put(items):
@@ -1269,7 +1269,7 @@ def bing_news_rss(query, limit=6):
     key="bing::"+query
     try:
         url="https://www.bing.com/news/search?q="+quote_plus(query)+"&format=rss&mkt=en-US"
-        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.6"},timeout=(2.5,5.0))
+        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.7"},timeout=(2.5,5.0))
         r.raise_for_status()
         items=_parse_rss_items(r.content,limit,"Bing News")
         _news_cache_put(key,items)
@@ -1285,14 +1285,14 @@ def direct_crypto_feeds(limit=10):
     feeds=[
         ("CoinDesk","https://www.coindesk.com/arc/outboundfeeds/rss/"),
         ("CNBC","https://www.cnbc.com/id/10000664/device/rss/rss.html"),
-        # v13.6: 검색엔진 장애와 독립된 추가 금융 피드. 실패해도 다른 피드는 계속 동작.
+        # v13.7: 검색엔진 장애와 독립된 추가 금융 피드. 실패해도 다른 피드는 계속 동작.
         ("CNBC Markets","https://www.cnbc.com/id/100003114/device/rss/rss.html"),
     ]
     out=[]
     for source,url in feeds:
         key="feed::"+source
         try:
-            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.6"},timeout=(2.5,5.0))
+            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.7"},timeout=(2.5,5.0))
             r.raise_for_status()
             items=_parse_rss_items(r.content,limit,source)
             _news_cache_put(key,items)
@@ -1328,7 +1328,7 @@ def google_news_rss(query, limit=4, priority=False):
         raise requests.exceptions.ReadTimeout("news circuit open")
     url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=ko&gl=KR&ceid=KR:ko"
     try:
-        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.6"}, timeout=(2.5,4.5))
+        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.7"}, timeout=(2.5,4.5))
         r.raise_for_status()
         root = ET.fromstring(r.content)
         items = []
@@ -1448,7 +1448,7 @@ def _macro_news(direction="DOWN"):
                     errors.append(type(e).__name__)
         return _dedupe_news(out), errors
 
-    # v13.6: 검색엔진보다 직접 RSS와 영구 캐시를 먼저 사용한다.
+    # v13.7: 검색엔진보다 직접 RSS와 영구 캐시를 먼저 사용한다.
     # Render에서 Bing/Google이 느릴 때 /cause 호출마다 다수의 timeout을 만드는 문제를 줄인다.
     first=[]; err1=[]
     try:
@@ -1464,7 +1464,7 @@ def _macro_news(direction="DOWN"):
         searched, err1=collect_parallel(urgent, limit=8)
         first=_dedupe_news(first + searched)
 
-    # v13.6 핵심: 현재 요청들이 timeout이어도 이전에 성공한 모든 거시 증거를
+    # v13.7 핵심: 현재 요청들이 timeout이어도 이전에 성공한 모든 거시 증거를
     # 검색어별 캐시와 별개인 영구 풀에서 병합한다. Render 재시작 후에도 복원됨.
     first=_dedupe_news(first + _macro_pool_get(80))
     fresh=[x for x in first if _news_age_hours(x)<=30 or _news_age_hours(x)>=999]
@@ -1599,7 +1599,7 @@ def _v133_stale_btc_price_title(title, btc_krw):
     return False, ""
 
 def market_cause_analysis_text(force_direction=None):
-    """v13.6: 실시간 검색 실패 시에도 영구 거시 증거풀을 병합해 직접 원인을 최대한 복원한다."""
+    """v13.7: 실시간 검색 실패 시에도 영구 거시 증거풀을 병합해 직접 원인을 최대한 복원한다."""
     move=market_move_snapshot(); btc=move.get("BTC",{})
     btc1=btc.get("ret1") or 0.0; btc5=btc.get("ret5") or 0.0
     try:
@@ -1618,7 +1618,24 @@ def market_cause_analysis_text(force_direction=None):
 
     expected=1 if direction=="UP" else -1
     ranked=[]; rejected_opposite=0; rejected_stale_price=0
-    for it in _macro_news(direction):
+    # v13.7: 뉴스 수집 예외가 /cause 전체를 죽이지 않도록 완전 격리.
+    news_collect_error = ""
+    try:
+        macro_items = _macro_news(direction)
+    except Exception as e:
+        news_collect_error = f"{type(e).__name__}: {str(e)[:120]}"
+        print("[/cause news isolated]", repr(e), flush=True)
+        try:
+            macro_items = _macro_pool_get(80)
+        except Exception:
+            macro_items = []
+        if not macro_items:
+            recovered=[]
+            for _k in ("feed::CoinDesk","feed::CNBC","feed::CNBC Markets"):
+                try: recovered.extend(_news_cache_get(_k,12,True))
+                except Exception: pass
+            macro_items=_dedupe_news(recovered)
+    for it in macro_items:
         title=it.get("title",""); cat=_macro_category(title)
         ds=_macro_direction_score(title,direction); age=_news_age_hours(it)
         polarity=_headline_polarity(title)
@@ -1675,7 +1692,9 @@ def market_cause_analysis_text(force_direction=None):
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v13.6】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v13.7】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    if news_collect_error:
+        parts += ["⚠️ 실시간 뉴스 수집 오류를 격리하고 영구 캐시로 계속 분석", ""]
     if NEWS_HEALTH.get("last_errors",0):
         parts.append(f"⚠️ 뉴스 연결 일부 지연 {NEWS_HEALTH['last_errors']}건 — 확보 기사 {NEWS_HEALTH.get('last_ok',0)}건으로 계속 분석")
         parts.append("")
@@ -1743,7 +1762,7 @@ def market_cause_worker(direction,cid):
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v13.6 급변 원인분석 테스트】\n\n"
+        "🧪 【v13.7 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
@@ -1765,7 +1784,9 @@ def causetest_text():
         "✅ Render 재시작·재배포 후 48시간 캐시 복원\n"
         "✅ 검색어별 캐시 + 통합 거시 증거풀 이중 보관\n"
         "✅ 실시간 timeout 시 영구 증거풀 자동 병합\n"
-        "✅ WLD/KAIA 뉴스보다 BTC 거시 원인 근거 우선 확보\n\n"
+        "✅ WLD/KAIA 뉴스보다 BTC 거시 원인 근거 우선 확보\n"
+        "✅ /cause 뉴스 예외 완전 격리 + 캐시 즉시 복구\n"
+        "✅ 뉴스 오류여도 /cause 전체 fallback 방지\n\n"
         "※ 가상 테스트이며 가격·평단·수량·현금·장부는 변경하지 않습니다."
     )
 
@@ -1933,11 +1954,12 @@ def cause_command_worker(cid):
         print("[/cause] error",repr(e),flush=True)
         try:
             m=market_move_snapshot().get("BTC",{})
-            send_long("⚠️ 【뉴스 연결 지연 — 가격·시장 데이터 분석】\n"
+            send_long("⚠️ 【/cause 내부 오류 격리】\n"
                       f"BTC 1분 {(m.get('ret1') or 0):+.2f}% · 5분 {(m.get('ret5') or 0):+.2f}%\n"
-                      "실시간 뉴스 연결이 지연되어 최근 성공 캐시까지 확인했지만 직접 근거가 부족합니다.\n"
+                      f"오류종류: {type(e).__name__}\n"
+                      "뉴스 연결 지연으로 단정하지 않고 오류 지점을 분리했습니다.\n"
                       "가격 감시·장부·재매수 안전필터는 정상 작동합니다.\n"
-                      "※ 원인을 억지로 추정하지 않습니다. 자동주문 없음.",cid)
+                      "※ 자동주문 없음.",cid)
         except Exception as e2:
             print("[/cause fallback] error",repr(e2),flush=True)
     finally:
