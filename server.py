@@ -10,7 +10,12 @@ app = Flask(__name__)
 COINS = {"WLD":{"avg":452.0,"qty":192495},"KAIA":{"avg":35.0,"qty":1131289}}
 URL = "https://api.coinone.co.kr/public/v2/ticker_new/KRW"
 SESSION = requests.Session()
-NEWS_HEALTH = {"last_errors":0, "last_ok":0, "last_ts":0.0}
+NEWS_HEALTH = {"last_errors":0, "last_ok":0, "last_ts":0.0, "circuit_until":0.0}
+NEWS_CACHE = {}
+NEWS_CACHE_LOCK = threading.RLock()
+NEWS_PRIORITY = threading.Event()
+NEWS_CACHE_TTL = 6 * 3600
+NEWS_STALE_TTL = 48 * 3600
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","").strip()
@@ -1151,19 +1156,51 @@ def good_radar_text():
     return "\n".join(parts)
 
 
-def google_news_rss(query, limit=4):
+def _news_cache_get(query, limit=4, allow_stale=True):
+    with NEWS_CACHE_LOCK:
+        row=NEWS_CACHE.get(query)
+        if not row: return []
+        age=time.time()-row.get("ts",0)
+        ttl=NEWS_STALE_TTL if allow_stale else NEWS_CACHE_TTL
+        if age>ttl: return []
+        return list(row.get("items",[]))[:limit]
+
+def _news_cache_put(query, items):
+    if not items: return
+    with NEWS_CACHE_LOCK:
+        NEWS_CACHE[query]={"ts":time.time(),"items":list(items)[:12]}
+        # 메모리 상한
+        if len(NEWS_CACHE)>120:
+            for k,_ in sorted(NEWS_CACHE.items(), key=lambda kv:kv[1].get("ts",0))[:20]:
+                NEWS_CACHE.pop(k,None)
+
+def google_news_rss(query, limit=4, priority=False):
+    """v12.9: 실시간 RSS → 실패 시 최근 성공 캐시. 반복 timeout 때 짧은 회로차단."""
+    now=time.time()
+    if not priority and now < NEWS_HEALTH.get("circuit_until",0):
+        cached=_news_cache_get(query,limit,True)
+        if cached: return cached
+        raise requests.exceptions.ReadTimeout("news circuit open")
     url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=ko&gl=KR&ceid=KR:ko"
-    r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/12.8"}, timeout=(3,6))
-    r.raise_for_status()
-    root = ET.fromstring(r.content)
-    items = []
-    for item in root.findall(".//item")[:limit]:
-        title = html.unescape((item.findtext("title") or "").strip())
-        link = (item.findtext("link") or "").strip()
-        source = html.unescape((item.findtext("source") or "").strip())
-        pubdate = (item.findtext("pubDate") or "").strip()
-        items.append({"title": title, "link": link, "source": source, "pubdate": pubdate})
-    return items
+    try:
+        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/12.9"}, timeout=(2.5,4.5))
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        items = []
+        for item in root.findall(".//item")[:limit]:
+            title = html.unescape((item.findtext("title") or "").strip())
+            link = (item.findtext("link") or "").strip()
+            source = html.unescape((item.findtext("source") or "").strip())
+            pubdate = (item.findtext("pubDate") or "").strip()
+            items.append({"title": title, "link": link, "source": source, "pubdate": pubdate})
+        _news_cache_put(query,items)
+        return items
+    except Exception:
+        # Google News가 느릴 때 정기 작업의 연쇄 timeout을 90초간 차단
+        NEWS_HEALTH["circuit_until"]=time.time()+90
+        cached=_news_cache_get(query,limit,True)
+        if cached: return cached
+        raise
 
 def classify_news(title):
     low = title.lower()
@@ -1247,7 +1284,7 @@ def _macro_news(direction="DOWN"):
 
     def one(q, limit=7):
         try:
-            return google_news_rss(q, limit), None
+            return google_news_rss(q, limit, priority=True), None
         except Exception as e:
             return [], type(e).__name__
 
@@ -1412,7 +1449,7 @@ def market_cause_analysis_text(force_direction=None):
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v12.8】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v12.9】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if NEWS_HEALTH.get("last_errors",0):
         parts.append(f"⚠️ 뉴스 연결 일부 지연 {NEWS_HEALTH['last_errors']}건 — 확보 기사 {NEWS_HEALTH.get('last_ok',0)}건으로 계속 분석")
         parts.append("")
@@ -1454,6 +1491,7 @@ def market_shock_triggered():
 
 
 def market_cause_worker(direction,cid):
+    NEWS_PRIORITY.set()
     try:
         with RAPID_LOCK:
             send_long(market_cause_analysis_text(direction),cid)
@@ -1469,12 +1507,14 @@ def market_cause_worker(direction,cid):
                 "※ 원인을 억지로 추정하지 않습니다. 자동주문 없음.", cid)
         except Exception as e2:
             print("[MarketCauseFallback] error",repr(e2),flush=True)
+    finally:
+        NEWS_PRIORITY.clear()
 
 
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v12.8 급변 원인분석 테스트】\n\n"
+        "🧪 【v12.9 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
@@ -1644,6 +1684,27 @@ def rapid_cause_report_text():
     parts.append("\n" + market_cause_analysis_text())
     return "\n".join(parts)
 
+
+def cause_command_worker(cid):
+    """사용자 /cause를 정기뉴스보다 우선 처리. 텔레그램 polling thread를 막지 않는다."""
+    NEWS_PRIORITY.set()
+    try:
+        with RAPID_LOCK:
+            send_long(rapid_cause_report_text(),cid)
+    except Exception as e:
+        print("[/cause] error",repr(e),flush=True)
+        try:
+            m=market_move_snapshot().get("BTC",{})
+            send_long("⚠️ 【뉴스 연결 지연 — 가격·시장 데이터 분석】\n"
+                      f"BTC 1분 {(m.get('ret1') or 0):+.2f}% · 5분 {(m.get('ret5') or 0):+.2f}%\n"
+                      "실시간 뉴스 연결이 지연되어 최근 성공 캐시까지 확인했지만 직접 근거가 부족합니다.\n"
+                      "가격 감시·장부·재매수 안전필터는 정상 작동합니다.\n"
+                      "※ 원인을 억지로 추정하지 않습니다. 자동주문 없음.",cid)
+        except Exception as e2:
+            print("[/cause fallback] error",repr(e2),flush=True)
+    finally:
+        NEWS_PRIORITY.clear()
+
 def market_brief():
     try:
         ticks = fetch_tickers()
@@ -1688,14 +1749,14 @@ def auto_news_loop():
             now=time.time()
 
             # 3시간마다: 시황 뉴스 + W/K 호재·전망·리스크 종합보고
-            if CHAT_ID and now - LAST_NEWS_SENT >= NEWS_INTERVAL:
+            if CHAT_ID and now - LAST_NEWS_SENT >= NEWS_INTERVAL and not NEWS_PRIORITY.is_set():
                 send_long("🕒 3시간 정기 뉴스·호재·전망 보고\n\n" + news_digest(), CHAT_ID)
                 send_long(good_radar_text(), CHAT_ID)
                 LAST_NEWS_SENT = now
                 print("[News] 3h news+catalyst digest sent", flush=True)
 
             # 10분마다 새 중요 호재/악재 확인. 시작 직후 기존 기사들은 기준선으로만 등록.
-            if CHAT_ID and now - LAST_BREAKING_CHECK >= BREAKING_CHECK_INTERVAL:
+            if CHAT_ID and now - LAST_BREAKING_CHECK >= BREAKING_CHECK_INTERVAL and not NEWS_PRIORITY.is_set():
                 candidates=breaking_candidates()
                 keys={news_key(it) for _,_,_,it in candidates if news_key(it)}
                 if not BREAKING_PRIMED:
@@ -1996,11 +2057,8 @@ def telegram_loop():
             elif text.split()[0].split("@")[0].lower() == "/causetest" if text else False:
                 send(causetest_text(),cid)
             elif text.split()[0].split("@")[0].lower() == "/cause" if text else False:
-                send("🔎 현재 W·K/BTC 변동과 최신 시장 원인을 함께 분석합니다.",cid)
-                try:
-                    send_long(rapid_cause_report_text(),cid)
-                except Exception as e:
-                    send(f"⚠️ 급변 원인 레이더 오류: {type(e).__name__}: {e}",cid)
+                send("🔎 현재 W·K/BTC 변동과 최신 시장 원인을 우선 분석합니다.",cid)
+                threading.Thread(target=cause_command_worker,args=(cid,),daemon=True).start()
             elif text.startswith("/news"):
                 send("📰 최신 뉴스를 수집하고 있습니다. 잠시만 기다려 주세요.",cid)
                 try:
