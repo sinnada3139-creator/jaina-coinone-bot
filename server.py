@@ -115,7 +115,7 @@ STATE = {
 
 load_persistent_state()
 
-# ---------- v12.4 MARKET SHOCK + TIME-AWARE CAUSE ENGINE ----------
+# ---------- v12.5 MARKET SHOCK + DIRECTION-VALIDATED CAUSE ENGINE ----------
 # BTC는 시장 전체 급변 여부를 판별하기 위한 참고 시세입니다. 자동주문에는 사용하지 않습니다.
 MARKET_HISTORY = {"BTC": deque(maxlen=240)}
 RAPID_LAST = {s:{"ts":0.0,"dir":""} for s in COINS}
@@ -1238,11 +1238,43 @@ def _macro_category(title):
 
 def _macro_direction_score(title, direction):
     low=(title or "").lower()
-    up=("rally","surge","gain","rebound","rate cut","dovish","etf inflow","approval","상승","급등","반등","금리 인하","비둘기파","유입","승인")
-    down=("drop","fall","plunge","selloff","sell-off","rate hike","hawkish","inflation","yield","dollar rises","outflow","liquidation","expiry","hack","ban","하락","급락","매도","금리 인상","매파","물가","국채금리","달러 강세","유출","청산","만기","해킹","규제")
+    up=("rally","surge","gain","rebound","jumps","soars","rate cut","dovish","etf inflow","approval","상승","급등","반등","오름","금리 인하","비둘기파","유입","승인")
+    down=("drop","fall","falls","plunge","slides","selloff","sell-off","rate hike","hawkish","inflation","yields rise","dollar rises","outflow","liquidation","expiry","hack","ban","하락","급락","약세","매도","금리 인상","매파","국채금리 상승","달러 강세","유출","청산","만기","해킹","규제")
     u=sum(1 for w in up if w in low); d=sum(1 for w in down if w in low)
     return (u-d) if direction=="UP" else (d-u)
 
+def _headline_polarity(title):
+    """제목이 상승/하락 중 어느 방향을 명시하는지 판별. 1=상승, -1=하락, 0=중립/불명확."""
+    low=(title or "").lower()
+    up=("rally","surge","soar","jump","gain","rebound","climb","rise","rises","higher","상승","급등","반등","강세","뛰는","오른","오름")
+    down=("drop","fall","falls","plunge","slide","slump","selloff","sell-off","decline","lower","하락","급락","약세","폭락","떨어","내린","매도세")
+    u=sum(1 for w in up if w in low); d=sum(1 for w in down if w in low)
+    if u>d: return 1
+    if d>u: return -1
+    return 0
+
+def _is_forecast_or_preview(title):
+    """실제 발생 기사보다 전망/사전예고 기사 우선순위를 낮춘다."""
+    low=(title or "").lower()
+    words=("ahead of","before jackson hole","preview","what to watch","could","may ","might","forecast","outlook","전망","앞두고","예상","가능성","어디까지","오를까","내릴까","주목")
+    return any(w in low for w in words)
+
+def _direct_event_score(title, cat):
+    """실제 발언/결정/발표/자금흐름처럼 인과성이 강한 제목에 가점."""
+    low=(title or "").lower()
+    event=("says","said","signals","warns","announces","raises","cuts","holds rates","data shows","outflow","inflow","liquidated","speech","remarks","발언","밝혀","발표","결정","인상","인하","동결","유출","유입","청산")
+    score=sum(1 for w in event if w in low)
+    if cat in ("연준·금리","미국 물가·고용") and any(w in low for w in ("fed","federal reserve","warsh","powell","연준","의장")):
+        score+=2
+    return min(score,4)
+
+def _source_quality(source):
+    low=(source or "").lower()
+    tier1=("reuters","bloomberg","associated press","ap news","financial times","wall street journal","cnbc")
+    tier2=("coindesk","the block","fortune","yahoo finance","sbs biz","뉴시스","연합뉴스")
+    if any(x in low for x in tier1): return 4
+    if any(x in low for x in tier2): return 2
+    return 1
 
 def _cause_chain(cat, direction):
     down = direction=="DOWN"
@@ -1260,7 +1292,7 @@ def _cause_chain(cat, direction):
 
 
 def market_cause_analysis_text(force_direction=None):
-    """v12.4: 임계치와 무관하게 24시간 뉴스를 검색하고 발행시각·방향·출처로 우선순위를 매긴다."""
+    """v12.5: 24시간 뉴스 + 가격방향 일치 + 실제 사건성 + 출처 품질을 검증한다."""
     move=market_move_snapshot(); btc=move.get("BTC",{})
     btc1=btc.get("ret1") or 0.0; btc5=btc.get("ret5") or 0.0
     try:
@@ -1277,19 +1309,28 @@ def market_cause_analysis_text(force_direction=None):
         vals=[move.get(s,{}).get("ret5") for s in ("WLD","KAIA") if move.get(s,{}).get("ret5") is not None]
         direction="UP" if (sum(vals)/len(vals) if vals else 0)>=0 else "DOWN"
 
-    ranked=[]
+    expected=1 if direction=="UP" else -1
+    ranked=[]; rejected_opposite=0
     for it in _macro_news(direction):
         title=it.get("title",""); cat=_macro_category(title)
-        ds=_macro_direction_score(title,direction); trust=source_weight(it.get("source"))
-        age=_news_age_hours(it)
-        freshness=4 if age<=6 else (3 if age<=12 else (2 if age<=24 else 0))
-        relevance=2 if cat!="시장 수급·기타" else 0
-        total=ds*3 + trust*2 + freshness + relevance
-        if total>=5 and (ds>0 or cat!="시장 수급·기타"):
-            ranked.append((total,ds,trust,freshness,cat,age,it))
-    ranked.sort(key=lambda x:(x[0],x[2],-x[5]),reverse=True)
+        ds=_macro_direction_score(title,direction); age=_news_age_hours(it)
+        polarity=_headline_polarity(title)
+        # 핵심 v12.5: 가격 방향과 명백히 반대인 제목은 원인 근거에서 제외.
+        if polarity and polarity != expected:
+            rejected_opposite += 1
+            continue
+        freshness=5 if age<=6 else (4 if age<=12 else (2 if age<=24 else 0))
+        relevance=3 if cat!="시장 수급·기타" else 0
+        sourceq=_source_quality(it.get("source"))
+        direct=_direct_event_score(title,cat)
+        forecast_penalty=5 if _is_forecast_or_preview(title) else 0
+        direction_bonus=5 if polarity==expected else 0
+        total=ds*3 + sourceq*2 + freshness + relevance + direct*2 + direction_bonus - forecast_penalty
+        # 전망성 기사 단독 또는 방향성 없는 약한 기사는 1순위 원인으로 올라오지 못하게 문턱 강화.
+        if total>=10 and (ds>0 or direct>=2):
+            ranked.append((total,ds,sourceq,freshness,cat,age,it,direct,forecast_penalty,polarity))
+    ranked.sort(key=lambda x:(x[0],x[2],x[7],-x[5]),reverse=True)
 
-    # 같은 제목/카테고리 반복을 줄여 서로 다른 원인 축을 보여준다.
     selected=[]; seen_cats=set()
     for row in ranked:
         if row[4] not in seen_cats:
@@ -1303,29 +1344,33 @@ def market_cause_analysis_text(force_direction=None):
     confidence=20
     if abs(btc24)>=1: confidence+=8
     if abs(btc24)>=2: confidence+=7
-    if selected: confidence+=20
-    if selected and selected[0][0]>=12: confidence+=15
-    if selected and selected[0][5]<=12: confidence+=10
-    if len(seen_cats)>=2: confidence+=8
-    confidence=max(20,min(92,confidence))
+    if selected: confidence+=15
+    if selected and selected[0][0]>=18: confidence+=15
+    if selected and selected[0][5]<=12: confidence+=8
+    if selected and selected[0][2]>=4: confidence+=10
+    if selected and selected[0][7]>=2: confidence+=7
+    if len(seen_cats)>=2: confidence+=5
+    confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v12.4】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v12.5】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if selected:
         top=selected[0]; topcat=top[4]
         parts += [f"🥇 1순위 원인 — {topcat}",_cause_chain(topcat,direction),f"🎯 원인 신뢰도 {confidence}/100",""]
         if len(selected)>1:
             parts.append("🔎 보조 원인/변동성 확대 요인")
             for i,row in enumerate(selected[1:3],2): parts.append(f"{i}순위 {row[4]} — {_cause_chain(row[4],direction)}")
-        parts.append("\n📰 기사 근거 · 시간 일치도")
+        parts.append("\n📰 기사 근거 · 방향/시간 검증")
         for row in selected[:3]:
-            _,_,_,_,cat,age,it=row
+            _,_,sourceq,_,cat,age,it,direct,forecast_penalty,polarity=row
             src=f" · {it.get('source')}" if it.get('source') else ""
             age_txt=f"약 {age:.1f}시간 전" if age<100 else "발행시각 확인불가"
-            parts.append(f"• [{cat} · {age_txt}] {it.get('title','')}{src}\n{it.get('link','')}")
-        parts.append("\n📌 판단: 최근 24시간 기사 중 가격 방향·발행시각·출처 신뢰도를 함께 점수화했습니다.")
+            kind="실제 사건/발언" if direct>=2 and not forecast_penalty else ("전망성 기사" if forecast_penalty else "관련 기사")
+            parts.append(f"• [{cat} · {age_txt} · {kind}] {it.get('title','')}{src}\n{it.get('link','')}")
+        parts.append(f"\n✅ 반대방향 제목 {rejected_opposite}건 자동 제외")
+        parts.append("📌 판단: 가격 방향·발행시각·실제 사건성·출처 품질을 함께 검증했습니다. 전망성 기사는 감점합니다.")
     else:
-        parts += ["🔎 최근 24시간 범위까지 넓혀 검색했지만 가격 방향과 시간대가 함께 맞는 직접 원인을 확인하지 못했습니다.","🎯 원인 신뢰도 20/100","📌 판단: 이 경우에만 수급성 움직임 가능성으로 남기며 원인을 억지로 단정하지 않습니다."]
+        parts += ["🔎 최근 24시간까지 검색했지만 가격 방향과 시간대가 함께 맞는 직접 근거를 확인하지 못했습니다.","🎯 원인 신뢰도 20/100",f"✅ 반대방향 제목 {rejected_opposite}건 자동 제외","📌 판단: 방향이 반대인 기사나 단순 전망 기사로 원인을 억지로 만들지 않습니다."]
     parts.append("※ 자동 뉴스 원인추정이며 실제 인과는 추가 확인이 필요합니다. 자동주문 없음.")
     return "\n".join(parts)
 
@@ -1357,12 +1402,15 @@ def market_cause_worker(direction,cid):
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v12.4 급변 원인분석 테스트】\n\n"
+        "🧪 【v12.5 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
         "✅ /cause 임계치 미도달 시에도 최신 원인 검색\n"
         "✅ 원인 신뢰도 + 기사 근거 표시\n"
+        "✅ 가격과 반대방향 기사 자동 제외\n"
+        "✅ 전망/사전예고 기사 감점 + 실제 발언/발표 우선\n"
+        "✅ Reuters/Bloomberg 등 고신뢰 출처 가중\n"
         "✅ 원인 미확인 시 억지 추정 금지\n\n"
         "※ 가상 테스트이며 가격·평단·수량·현금·장부는 변경하지 않습니다."
     )
