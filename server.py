@@ -2164,6 +2164,109 @@ def run_enginetest(cid):
     header="✅ v11 판단엔진 전체 통과" if all_ok else "❌ v11 판단엔진 일부 실패"
     send(header+"\n\n"+"\n\n".join(lines),cid)
 
+# ---------- v14.0 PRE-EVENT MARKET RADAR ----------
+EVENT_RADAR_INTERVAL = 15 * 60
+EVENT_RADAR_LAST_DAILY = ""
+EVENT_RADAR_SENT = set()
+KST = timezone(timedelta(hours=9))
+ET = timezone(timedelta(hours=-4))  # 2026 Sep-Oct scheduled releases are during U.S. daylight time
+
+# High-impact dates from official Fed/BLS 2026 calendars. Times are converted to Korea time.
+SCHEDULED_MARKET_EVENTS = [
+    ("2026-09-01T10:00:00-04:00","🟠","미국 JOLTS","고용 수요 변화 → 금리 기대·BTC 변동성"),
+    ("2026-09-04T08:30:00-04:00","🔴","미국 고용보고서","연준 금리경로 핵심 지표 → 주식·BTC 변동성 확대 가능"),
+    ("2026-09-10T08:30:00-04:00","🟠","미국 PPI","물가 압력 확인 → 금리·달러·BTC 영향 가능"),
+    ("2026-09-11T08:30:00-04:00","🔴","미국 CPI","인플레이션 핵심 지표 → 주식·BTC 급변 가능"),
+    ("2026-09-16T14:00:00-04:00","🔴","FOMC 금리결정·성명","연준 정책·점도표·기자회견 → 최중요 시장 이벤트"),
+    ("2026-09-29T10:00:00-04:00","🟠","미국 JOLTS","고용 수요 변화 → 금리 기대 영향"),
+    ("2026-10-02T08:30:00-04:00","🔴","미국 고용보고서","연준 금리경로 핵심 지표"),
+    ("2026-10-07T14:00:00-04:00","🟠","FOMC 의사록","연준 내부 시각·향후 금리경로 단서"),
+    ("2026-10-14T08:30:00-04:00","🔴","미국 CPI","인플레이션 핵심 지표"),
+    ("2026-10-15T08:30:00-04:00","🟠","미국 PPI","생산자물가 → 금리 기대 영향"),
+    ("2026-10-28T14:00:00-04:00","🔴","FOMC 금리결정·성명","연준 정책·기자회견 → 최중요 시장 이벤트"),
+    ("2026-11-06T08:30:00-05:00","🔴","미국 고용보고서","연준 금리경로 핵심 지표"),
+    ("2026-11-10T08:30:00-05:00","🔴","미국 CPI","인플레이션 핵심 지표"),
+    ("2026-11-13T08:30:00-05:00","🟠","미국 PPI","생산자물가 → 금리 기대 영향"),
+    ("2026-12-04T08:30:00-05:00","🔴","미국 고용보고서","연준 금리경로 핵심 지표"),
+    ("2026-12-09T14:00:00-05:00","🔴","FOMC 금리결정·성명","연준 정책·점도표·기자회견 → 최중요 시장 이벤트"),
+    ("2026-12-10T08:30:00-05:00","🔴","미국 CPI","인플레이션 핵심 지표"),
+    ("2026-12-15T08:30:00-05:00","🟠","미국 PPI","생산자물가 → 금리 기대 영향"),
+]
+
+def _event_dt(raw):
+    return datetime.fromisoformat(raw).astimezone(KST)
+
+def upcoming_scheduled_events(hours=168):
+    now=datetime.now(KST); out=[]
+    for raw,level,name,impact in SCHEDULED_MARKET_EVENTS:
+        dt=_event_dt(raw); delta=(dt-now).total_seconds()/3600
+        if 0 <= delta <= hours:
+            out.append((dt,delta,level,name,impact))
+    return sorted(out,key=lambda x:x[0])
+
+def dynamic_policy_radar(limit=4):
+    # Upcoming crypto regulation/ETF/legal catalysts. Only surface articles whose titles explicitly signal a future action.
+    queries=[
+        'US crypto bill vote hearing deadline SEC CFTC stablecoin market structure when:7d',
+        'Bitcoin crypto ETF SEC decision deadline approval when:7d',
+        'Worldcoin WLD regulation launch unlock partnership upcoming when:7d',
+        'KAIA Kaia blockchain launch partnership regulation upcoming when:7d',
+    ]
+    future_words=('vote','voting','hearing','deadline','scheduled','upcoming','expected','set to','will ','approval','decision','표결','청문','마감','예정','심사','승인')
+    rows=[]; seen=set()
+    for q in queries:
+        try:
+            for it in google_news_rss(q,3):
+                title=(it.get('title') or '').strip(); low=title.lower()
+                if not title or not any(w in low for w in future_words): continue
+                k=title.lower()[:140]
+                if k in seen: continue
+                seen.add(k); rows.append(it)
+        except Exception:
+            pass
+    return rows[:limit]
+
+def event_radar_text():
+    parts=['📡 【자이나 시장 이벤트 사전 레이더】']
+    ev=upcoming_scheduled_events(168)
+    if ev:
+        for dt,delta,level,name,impact in ev[:8]:
+            if delta < 24: left=f'{delta:.1f}시간 전'
+            else: left=f'{delta/24:.1f}일 전'
+            parts.append(f'{level} {name} · {dt:%m/%d %H:%M} 한국시간 · {left}\n→ {impact}')
+    else:
+        parts.append('향후 7일 공식 일정 중 등록된 최중요 이벤트 없음')
+    dyn=dynamic_policy_radar(4)
+    if dyn:
+        parts.append('\n🧭 법안·규제·ETF·WLD/KAIA 예정 이슈 후보')
+        for it in dyn:
+            parts.append(f"• {it.get('title','')}\n{it.get('link','')}")
+    parts.append('\n※ 예정 이슈는 사전경계용. 실제 발표 직후 가격 급변 시 기존 중요알람·원인분석·수익보호 판단이 우선 작동합니다.')
+    parts.append('※ 자동주문 없음')
+    return '\n'.join(parts)
+
+def event_radar_loop():
+    global EVENT_RADAR_LAST_DAILY
+    while True:
+        try:
+            now=datetime.now(KST)
+            # Daily morning briefing once after 09:00 KST
+            day=now.strftime('%Y-%m-%d')
+            if CHAT_ID and now.hour >= 9 and EVENT_RADAR_LAST_DAILY != day:
+                send_long(event_radar_text(),CHAT_ID); EVENT_RADAR_LAST_DAILY=day
+            # Escalation reminders: 24h and 3h before red/orange official events
+            if CHAT_ID:
+                for dt,delta,level,name,impact in upcoming_scheduled_events(30):
+                    for tag,lo,hi in [('24H',20,26),('3H',2,4)]:
+                        key=f'{dt.isoformat()}:{tag}'
+                        if lo <= delta <= hi and key not in EVENT_RADAR_SENT:
+                            EVENT_RADAR_SENT.add(key)
+                            send(f'🚨 시장 이벤트 임박 {tag}\n{level} {name}\n한국시간 {dt:%m/%d %H:%M}\n→ {impact}\n발표 전후 BTC·WLD·KAIA 급변 집중감시',CHAT_ID)
+        except Exception as e:
+            print('[EventRadar] error',e,flush=True)
+        time.sleep(EVENT_RADAR_INTERVAL)
+
+
 def telegram_loop():
     global TG_OFFSET, CHAT_ID
     if not TOKEN:
@@ -2186,7 +2289,9 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v12.4 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v14.0 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+            elif text.startswith("/radar"):
+                send_long(event_radar_text(),cid)
             elif text.startswith("/sellqty"):
                 try:
                     p=text.split(maxsplit=4)
@@ -2387,6 +2492,7 @@ def health(): return "OK",200
 
 threading.Thread(target=monitor_loop,daemon=True).start()
 threading.Thread(target=telegram_loop,daemon=True).start()
+threading.Thread(target=event_radar_loop,daemon=True).start()
 threading.Thread(target=persistence_loop,daemon=True).start()
 threading.Thread(target=auto_news_loop,daemon=True).start()
 threading.Thread(target=auto_summary_loop,daemon=True).start()
