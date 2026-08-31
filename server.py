@@ -167,7 +167,7 @@ MARKET_HISTORY = {"BTC": deque(maxlen=5200)}
 RAPID_LAST = {s:{"ts":0.0,"dir":""} for s in COINS}
 RAPID_COOLDOWN = 30 * 60
 RAPID_LOCK = threading.Lock()
-# v14.3: 순간 임계치 미도달이어도 지속 하락+추세 붕괴를 별도 감지
+# v14.4: 순간 임계치 미도달이어도 지속 하락+추세 붕괴를 별도 감지
 SUSTAINED_LAST = {s:{"ts":0.0} for s in COINS}
 SUSTAINED_COOLDOWN = 60 * 60
 MARKET_CAUSE_LAST = {"ts":0.0,"dir":""}
@@ -926,7 +926,7 @@ def monitor_loop():
                 if s not in COINS:
                     continue
                 d=strategy(s,tick)
-                # v14.3: 순간/누적 급변뿐 아니라 지속 하락+15분/4시간 추세 붕괴도 중요 원인알람
+                # v14.4: 순간/누적 급변뿐 아니라 지속 하락+15분/4시간 추세 붕괴도 중요 원인알람
                 sustained = CHAT_ID and sustained_decline_triggered(s,d)
                 rapid = CHAT_ID and rapid_triggered(s,d)
                 if sustained or rapid:
@@ -1722,7 +1722,7 @@ def market_cause_analysis_text(force_direction=None):
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v13.8】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v14.4】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if news_collect_error:
         parts += ["⚠️ 실시간 뉴스 수집 오류를 격리하고 영구 캐시로 계속 분석", ""]
     if NEWS_HEALTH.get("last_errors",0):
@@ -1933,7 +1933,7 @@ def rapid_cause_text(symbol, d):
 
 
 def sustained_decline_status(symbol,d):
-    """v14.3: 누적봉이 0이어도 기존 일간/고점/추세 데이터로 지속하락 상태를 직접 판정."""
+    """v14.4: 누적봉이 0이어도 기존 일간/고점/추세 데이터로 지속하락 상태를 직접 판정."""
     daily=d.get("daily",{}) or {}
     prev=safe_float(daily.get("prev24_change_pct")) if daily.get("ready") else 0.0
     today=safe_float(daily.get("today_change_pct")) if daily.get("ready") else 0.0
@@ -1982,7 +1982,12 @@ def rapid_triggered(symbol,d):
 def rapid_cause_worker(symbol,d,cid):
     try:
         with RAPID_LOCK:
-            send_long(rapid_cause_text(symbol,d),cid)
+            # v14.4: 지속하락 트리거는 BTC 단기 반등과 무관하게 하락 원인으로 고정
+            if d.get("sustained_decline"):
+                send_long(rapid_cause_text(symbol,d),cid)
+                send_long(market_cause_analysis_text("DOWN"),cid)
+            else:
+                send_long(rapid_cause_text(symbol,d),cid)
     except Exception as e:
         print("[RapidCause] error",symbol,repr(e),flush=True)
 
@@ -2007,7 +2012,12 @@ def rapid_cause_report_text():
     m=market_move_snapshot().get("BTC",{})
     parts.append(f"\nBTC 참고: 1분 {(m.get('ret1') or 0):+.2f}% · 5분 {(m.get('ret5') or 0):+.2f}% · 30분 {(m.get('ret30') or 0):+.2f}% · 1시간 {(m.get('ret60') or 0):+.2f}% · 4시간 {(m.get('ret4h') or 0):+.2f}%")
     parts.append("※ 자동알림: 순간급변 + 30분·1시간·4시간 누적 급등락 동시 감시")
-    parts.append("\n" + market_cause_analysis_text())
+    # v14.4: WLD/KAIA 중 하나라도 지속하락이면 수동 /cause도 하락 방향으로 분석
+    sustained_any = any(
+        sustained_decline_status(sym, snap.get(sym))[0]
+        for sym in ("WLD", "KAIA") if snap.get(sym)
+    )
+    parts.append("\n" + market_cause_analysis_text("DOWN" if sustained_any else None))
     return "\n".join(parts)
 
 
@@ -2230,7 +2240,7 @@ def run_enginetest(cid):
     header="✅ v11 판단엔진 전체 통과" if all_ok else "❌ v11 판단엔진 일부 실패"
     send(header+"\n\n"+"\n\n".join(lines),cid)
 
-# ---------- v14.3 PRE-EVENT MARKET RADAR + SUSTAINED DECLINE ALERT ----------
+# ---------- v14.4 PRE-EVENT MARKET RADAR + SUSTAINED DECLINE ALERT ----------
 EVENT_RADAR_INTERVAL = 15 * 60
 EVENT_RADAR_LAST_DAILY = ""
 EVENT_RADAR_SENT = set()
@@ -2355,7 +2365,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v14.3 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v14.4 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
             elif text.startswith("/radar"):
                 send_long(event_radar_text(),cid)
             elif text.startswith("/sellqty"):
