@@ -167,6 +167,9 @@ MARKET_HISTORY = {"BTC": deque(maxlen=5200)}
 RAPID_LAST = {s:{"ts":0.0,"dir":""} for s in COINS}
 RAPID_COOLDOWN = 30 * 60
 RAPID_LOCK = threading.Lock()
+# v14.2: 순간 임계치 미도달이어도 지속 하락+추세 붕괴를 별도 감지
+SUSTAINED_LAST = {s:{"ts":0.0} for s in COINS}
+SUSTAINED_COOLDOWN = 60 * 60
 MARKET_CAUSE_LAST = {"ts":0.0,"dir":""}
 MARKET_CAUSE_COOLDOWN = 30 * 60
 
@@ -923,9 +926,14 @@ def monitor_loop():
                 if s not in COINS:
                     continue
                 d=strategy(s,tick)
-                # v12.2: 중요 급등/급락은 기존 신호알림과 별도로 즉시 원인분석을 백그라운드에서 실행
-                if CHAT_ID and rapid_triggered(s,d):
-                    send(f"⚡ {s} 중요 급변/누적변동 감지 — 원인을 즉시 분석하고 있습니다.",CHAT_ID)
+                # v14.2: 순간/누적 급변뿐 아니라 지속 하락+15분/4시간 추세 붕괴도 중요 원인알람
+                sustained = CHAT_ID and sustained_decline_triggered(s,d)
+                rapid = CHAT_ID and rapid_triggered(s,d)
+                if sustained or rapid:
+                    if sustained:
+                        send(f"🚨 【중요 지속하락 감지 — {s}】\n{d.get('sustained_reason','')}\n🔎 순간 임계치 미도달이어도 하락 원인을 즉시 분석합니다.",CHAT_ID)
+                    else:
+                        send(f"⚡ {s} 중요 급변/누적변동 감지 — 원인을 즉시 분석하고 있습니다.",CHAT_ID)
                     threading.Thread(target=rapid_cause_worker,args=(s,dict(d),CHAT_ID),daemon=True).start()
                 with LOCK:
                     st=STATE[s]
@@ -1844,7 +1852,7 @@ def _news_direction_score(title, direction):
 
 def rapid_cause_text(symbol, d):
     """가격·거래량·BTC/동료코인 동조·최신뉴스를 합쳐 '원인 후보'를 설명."""
-    direction="UP" if d.get("ret1m",0)>0 or d.get("ret5m",0)>0 else "DOWN"
+    direction="UP" if safe_float(d.get("rapid_move"), d.get("ret1m",0) or d.get("ret5m",0))>0 else "DOWN"
     icon="🚀" if direction=="UP" else "🚨"
     label="급등" if direction=="UP" else "급락"
     move=market_move_snapshot()
@@ -1901,6 +1909,7 @@ def rapid_cause_text(symbol, d):
         f"{icon} 【중요 {label} 원인 알림 — {symbol}】",
         f"현재가 {safe_float(d.get('price')):,.4f}원",
         f"1분 {safe_float(d.get('ret1m')):+.2f}% · 5분 {safe_float(d.get('ret5m')):+.2f}% · 거래량 {safe_float(d.get('vol_ratio'),1):.2f}배",
+        *(([f"📉 지속하락 조건: {d.get('sustained_reason','확인')}" ]) if d.get("sustained_decline") else []),
         "",
         "🔎 원인 후보",
     ]
@@ -1923,8 +1932,35 @@ def rapid_cause_text(symbol, d):
     return "\n".join(parts)
 
 
+def sustained_decline_triggered(symbol,d):
+    """v14.2: 하루에 걸친 지속 하락 + 15분/4시간 추세 동시 붕괴를 중요알람으로 승격."""
+    daily=d.get("daily",{}) or {}
+    prev=safe_float(daily.get("prev24_change_pct")) if daily.get("ready") else 0.0
+    draw=safe_float(d.get("drawdown_pct"))
+    trend=d.get("trend",{}) or {}
+    score=safe_float(trend.get("score"),100)
+    short=trend.get("short",{}) or {}; mid=trend.get("mid",{}) or {}
+    short_broken=(not short.get("ema_bull",True)) and (not short.get("macd_bull",True))
+    mid_broken=(not mid.get("ema_bull",True)) and (not mid.get("macd_bull",True))
+
+    # 두 경로 중 하나면 발동:
+    # A) 전일09시 대비 -4% 이하 + 양 시간대 추세 붕괴
+    # B) 최근 고점 대비 -12% 이하 + 추세점수 30 이하 + 양 시간대 추세 붕괴
+    hit_daily=(daily.get("ready") and prev <= -4.0 and short_broken and mid_broken)
+    hit_draw=(draw <= -12.0 and score <= 30 and short_broken and mid_broken)
+    if not (hit_daily or hit_draw): return False
+    now=time.time(); last=SUSTAINED_LAST[symbol]
+    if now-last.get("ts",0)<SUSTAINED_COOLDOWN: return False
+    last["ts"]=now
+    d["rapid_basis"]="지속하락"
+    d["rapid_move"]=prev if hit_daily else draw
+    d["sustained_decline"]=True
+    d["sustained_reason"]=(f"전일09시 {prev:+.2f}% · 고점대비 {draw:+.2f}% · 추세 {score:.0f}/100 · 15분/4시간 동시 약세")
+    return True
+
+
 def rapid_triggered(symbol,d):
-    """WLD/KAIA 순간 + 누적 급등락 감지. 서서히 무너지는 장도 놓치지 않는다."""
+    """WLD/KAIA 순간 + 누적 급등락 감지."""
     checks=[("1분",safe_float(d.get("ret1m")),3.0),("5분",safe_float(d.get("ret5m")),5.0),
             ("30분",d.get("ret30m"),5.0),("1시간",d.get("ret1h"),7.0),("4시간",d.get("ret4h"),10.0)]
     hits=[(lab,float(val),th) for lab,val,th in checks if val is not None and abs(float(val))>=th]
@@ -2184,7 +2220,7 @@ def run_enginetest(cid):
     header="✅ v11 판단엔진 전체 통과" if all_ok else "❌ v11 판단엔진 일부 실패"
     send(header+"\n\n"+"\n\n".join(lines),cid)
 
-# ---------- v14.1 PRE-EVENT MARKET RADAR ----------
+# ---------- v14.2 PRE-EVENT MARKET RADAR + SUSTAINED DECLINE ALERT ----------
 EVENT_RADAR_INTERVAL = 15 * 60
 EVENT_RADAR_LAST_DAILY = ""
 EVENT_RADAR_SENT = set()
@@ -2309,7 +2345,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v14.1 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v14.2 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
             elif text.startswith("/radar"):
                 send_long(event_radar_text(),cid)
             elif text.startswith("/sellqty"):
