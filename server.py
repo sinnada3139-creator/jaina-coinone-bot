@@ -146,7 +146,7 @@ def persistence_loop():
 STATE = {
     s: {
         "peak":0.0,
-        "history":deque(maxlen=240),
+        "history":deque(maxlen=5200),
         "price":0.0,
         "signal":"연결 대기",
         "score":0,
@@ -163,7 +163,7 @@ load_persistent_state()
 
 # ---------- v12.8 MARKET SHOCK + DEEP CAUSE SEARCH + SAFE REBUY FILTER ----------
 # BTC는 시장 전체 급변 여부를 판별하기 위한 참고 시세입니다. 자동주문에는 사용하지 않습니다.
-MARKET_HISTORY = {"BTC": deque(maxlen=240)}
+MARKET_HISTORY = {"BTC": deque(maxlen=5200)}
 RAPID_LAST = {s:{"ts":0.0,"dir":""} for s in COINS}
 RAPID_COOLDOWN = 30 * 60
 RAPID_LOCK = threading.Lock()
@@ -620,6 +620,9 @@ def strategy(symbol, tick):
         p5m=hist[-100][1] if len(hist)>=100 else hist[0][1]
         ret1=pct(p,p1m)
         ret5=pct(p,p5m)
+        ret30=_time_return(hist,30*60)
+        ret60=_time_return(hist,60*60)
+        ret4h=_time_return(hist,4*60*60)
         price_dd=pct(p,st["peak"])
         gain=pct(p,meta["avg"])
 
@@ -813,6 +816,9 @@ def strategy(symbol, tick):
             "drawdown_pct":price_dd,
             "ret1m":ret1,
             "ret5m":ret5,
+            "ret30m":ret30,
+            "ret1h":ret60,
+            "ret4h":ret4h,
             "vol_ratio":vol_ratio,
             "signal":signal,
             "score":score,
@@ -911,7 +917,7 @@ def monitor_loop():
                     market_dir=market_shock_triggered()
                     if market_dir:
                         lab="급등" if market_dir=="UP" else "급락"
-                        send(f"🌐 BTC 선행 {lab} 감지 — WLD·KAIA 영향 원인을 즉시 분석합니다.",CHAT_ID)
+                        send(f"🌐 BTC 선행/누적 {lab} 감지 — WLD·KAIA 영향 원인을 즉시 분석합니다.",CHAT_ID)
                         threading.Thread(target=market_cause_worker,args=(market_dir,CHAT_ID),daemon=True).start()
             for s,tick in ticks.items():
                 if s not in COINS:
@@ -919,7 +925,7 @@ def monitor_loop():
                 d=strategy(s,tick)
                 # v12.2: 중요 급등/급락은 기존 신호알림과 별도로 즉시 원인분석을 백그라운드에서 실행
                 if CHAT_ID and rapid_triggered(s,d):
-                    send(f"⚡ {s} 중요 급변 감지 — 원인을 즉시 분석하고 있습니다.",CHAT_ID)
+                    send(f"⚡ {s} 중요 급변/누적변동 감지 — 원인을 즉시 분석하고 있습니다.",CHAT_ID)
                     threading.Thread(target=rapid_cause_worker,args=(s,dict(d),CHAT_ID),daemon=True).start()
                 with LOCK:
                     st=STATE[s]
@@ -1364,20 +1370,33 @@ def _series_return(hist, points):
     return pct(seq[-1][1], seq[-points][1])
 
 
+def _time_return(hist, seconds):
+    """현재 시각에서 seconds 전과 가장 가까운 저장가격 대비 등락률."""
+    seq=list(hist)
+    if len(seq) < 2:
+        return None
+    now_ts=seq[-1][0]; target=now_ts-seconds
+    # 목표시각까지 데이터가 쌓이지 않았으면 잘못된 누적률을 만들지 않는다.
+    if seq[0][0] > target + 30:
+        return None
+    old=min(seq, key=lambda x: abs(x[0]-target))
+    return pct(seq[-1][1], old[1]) if old[1] else None
+
+
 def market_move_snapshot():
-    """BTC와 W/K의 단기 움직임을 원인분석용으로 묶어 반환."""
+    """BTC와 W/K의 순간 + 누적 움직임을 원인분석용으로 묶어 반환."""
     with LOCK:
-        btc1=_series_return(MARKET_HISTORY["BTC"],20)
-        btc5=_series_return(MARKET_HISTORY["BTC"],100)
-        coins={}
+        def pack(h, price=0.0):
+            return {
+                "ret1":_series_return(h,20), "ret5":_series_return(h,100),
+                "ret30":_time_return(h,30*60), "ret60":_time_return(h,60*60),
+                "ret4h":_time_return(h,4*60*60), "price":price,
+            }
+        out={"BTC":pack(MARKET_HISTORY["BTC"])}
         for sym in ("WLD","KAIA"):
             h=STATE[sym].get("history") or []
-            coins[sym]={
-                "ret1":_series_return(h,20),
-                "ret5":_series_return(h,100),
-                "price":safe_float(STATE[sym].get("price")),
-            }
-    return {"BTC":{"ret1":btc1,"ret5":btc5}, **coins}
+            out[sym]=pack(h,safe_float(STATE[sym].get("price")))
+    return out
 
 
 def _parse_pub_ts(pubdate):
@@ -1611,6 +1630,8 @@ def market_cause_analysis_text(force_direction=None):
         btc24=0.0; btcprice=0.0
 
     if force_direction in ("UP","DOWN"): direction=force_direction
+    elif btc.get("ret4h") is not None and abs(btc.get("ret4h"))>=1.0: direction="UP" if btc.get("ret4h")>0 else "DOWN"
+    elif btc.get("ret60") is not None and abs(btc.get("ret60"))>=0.7: direction="UP" if btc.get("ret60")>0 else "DOWN"
     elif abs(btc5)>=0.35: direction="UP" if btc5>0 else "DOWN"
     elif abs(btc24)>=0.5: direction="UP" if btc24>0 else "DOWN"
     else:
@@ -1723,19 +1744,19 @@ def market_cause_analysis_text(force_direction=None):
     return "\n".join(parts)
 
 def market_shock_triggered():
-    """BTC가 먼저 움직이는 시장충격을 감지. W/K 임계치 도달 전에도 원인분석 알림을 허용."""
+    """BTC 순간충격 + 30분/1시간/4시간 누적 급등락을 감지."""
     m=market_move_snapshot().get("BTC",{})
-    r1=m.get("ret1"); r5=m.get("ret5")
-    with LOCK:
-        hlen=len(MARKET_HISTORY["BTC"])
-    hit=(hlen>=20 and r1 is not None and abs(r1)>=1.0) or (hlen>=100 and r5 is not None and abs(r5)>=2.0)
-    if not hit: return None
-    basis=r1 if (r1 is not None and abs(r1)>=1.0) else (r5 or 0.0)
+    checks=[("1분",m.get("ret1"),1.0),("5분",m.get("ret5"),2.0),
+            ("30분",m.get("ret30"),2.5),("1시간",m.get("ret60"),3.5),("4시간",m.get("ret4h"),6.0)]
+    hits=[(lab,val,th) for lab,val,th in checks if val is not None and abs(val)>=th]
+    if not hits: return None
+    lab,basis,th=max(hits,key=lambda x:abs(x[1])/x[2])
     direction="UP" if basis>0 else "DOWN"
     now=time.time()
     if MARKET_CAUSE_LAST["dir"]==direction and now-MARKET_CAUSE_LAST["ts"]<MARKET_CAUSE_COOLDOWN:
         return None
     MARKET_CAUSE_LAST["dir"]=direction; MARKET_CAUSE_LAST["ts"]=now
+    MARKET_CAUSE_LAST["basis"]=lab; MARKET_CAUSE_LAST["move"]=basis
     return direction
 
 
@@ -1903,19 +1924,18 @@ def rapid_cause_text(symbol, d):
 
 
 def rapid_triggered(symbol,d):
-    """중요 급변만 감지. 1분 ±3% 또는 5분 ±5%를 기본 임계치로 사용."""
-    with LOCK:
-        hlen=len(STATE[symbol].get("history") or [])
-    r1=safe_float(d.get("ret1m")); r5=safe_float(d.get("ret5m"))
-    hit=(hlen>=20 and abs(r1)>=3.0) or (hlen>=100 and abs(r5)>=5.0)
-    if not hit:
-        return False
-    direction="UP" if (abs(r1)>=3.0 and r1>0) or (abs(r1)<3.0 and r5>0) else "DOWN"
+    """WLD/KAIA 순간 + 누적 급등락 감지. 서서히 무너지는 장도 놓치지 않는다."""
+    checks=[("1분",safe_float(d.get("ret1m")),3.0),("5분",safe_float(d.get("ret5m")),5.0),
+            ("30분",d.get("ret30m"),5.0),("1시간",d.get("ret1h"),7.0),("4시간",d.get("ret4h"),10.0)]
+    hits=[(lab,float(val),th) for lab,val,th in checks if val is not None and abs(float(val))>=th]
+    if not hits: return False
+    lab,basis,th=max(hits,key=lambda x:abs(x[1])/x[2])
+    direction="UP" if basis>0 else "DOWN"
     now=time.time(); last=RAPID_LAST[symbol]
-    # 같은 방향은 30분 중복 억제. 반대 방향으로 급반전하면 즉시 새 알림 허용.
     if last["dir"]==direction and now-last["ts"]<RAPID_COOLDOWN:
         return False
-    last["dir"]=direction; last["ts"]=now
+    last["dir"]=direction; last["ts"]=now; last["basis"]=lab; last["move"]=basis
+    d["rapid_basis"]=lab; d["rapid_move"]=basis
     return True
 
 
@@ -1933,14 +1953,14 @@ def rapid_cause_report_text():
     for sym in ("WLD","KAIA"):
         d=snap.get(sym)
         if not d: continue
-        parts.append(f"\n{sym}: 1분 {d.get('ret1m',0):+.2f}% · 5분 {d.get('ret5m',0):+.2f}% · 거래량 {d.get('vol_ratio',1):.2f}배")
-        if abs(d.get('ret1m',0))>=3 or abs(d.get('ret5m',0))>=5:
+        parts.append(f"\n{sym}: 1분 {d.get('ret1m',0):+.2f}% · 5분 {d.get('ret5m',0):+.2f}% · 30분 {(d.get('ret30m') or 0):+.2f}% · 1시간 {(d.get('ret1h') or 0):+.2f}% · 4시간 {(d.get('ret4h') or 0):+.2f}% · 거래량 {d.get('vol_ratio',1):.2f}배")
+        if abs(d.get('ret1m',0))>=3 or abs(d.get('ret5m',0))>=5 or abs(d.get('ret30m') or 0)>=5 or abs(d.get('ret1h') or 0)>=7 or abs(d.get('ret4h') or 0)>=10:
             parts.append("→ W/K 중요 급변 기준 도달")
         else:
             parts.append("→ W/K 중요 급변 기준 미도달 — 그래도 시장 원인은 아래에서 분석")
     m=market_move_snapshot().get("BTC",{})
-    parts.append(f"\nBTC 참고: 1분 {(m.get('ret1') or 0):+.2f}% · 5분 {(m.get('ret5') or 0):+.2f}%")
-    parts.append("※ 자동알림: W/K 1분 ±3%·5분 ±5% + BTC 선행충격 1분 ±1%·5분 ±2% 감시")
+    parts.append(f"\nBTC 참고: 1분 {(m.get('ret1') or 0):+.2f}% · 5분 {(m.get('ret5') or 0):+.2f}% · 30분 {(m.get('ret30') or 0):+.2f}% · 1시간 {(m.get('ret60') or 0):+.2f}% · 4시간 {(m.get('ret4h') or 0):+.2f}%")
+    parts.append("※ 자동알림: 순간급변 + 30분·1시간·4시간 누적 급등락 동시 감시")
     parts.append("\n" + market_cause_analysis_text())
     return "\n".join(parts)
 
@@ -2164,7 +2184,7 @@ def run_enginetest(cid):
     header="✅ v11 판단엔진 전체 통과" if all_ok else "❌ v11 판단엔진 일부 실패"
     send(header+"\n\n"+"\n\n".join(lines),cid)
 
-# ---------- v14.0 PRE-EVENT MARKET RADAR ----------
+# ---------- v14.1 PRE-EVENT MARKET RADAR ----------
 EVENT_RADAR_INTERVAL = 15 * 60
 EVENT_RADAR_LAST_DAILY = ""
 EVENT_RADAR_SENT = set()
@@ -2289,7 +2309,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v14.0 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v14.1 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
             elif text.startswith("/radar"):
                 send_long(event_radar_text(),cid)
             elif text.startswith("/sellqty"):
