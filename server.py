@@ -62,6 +62,37 @@ def load_persistent_state():
                 except Exception:
                     continue
 
+        # v14.9: restore up to ~4h+ of WLD/KAIA/BTC price history.
+        # Keep original sampling timestamps so 30m/1h/4h returns work immediately after redeploy.
+        saved_price_history = saved.get("_price_history", {}) or {}
+        cutoff = now_ts - (5 * 3600)
+        with LOCK:
+            for symbol in COINS:
+                rows = list(saved_price_history.get(symbol, []) or [])[-5200:]
+                restored = []
+                for row in rows:
+                    try:
+                        ts, pr, qv = float(row[0]), float(row[1]), float(row[2] if len(row) > 2 else 0)
+                        if ts >= cutoff and pr > 0:
+                            restored.append((ts, pr, qv))
+                    except Exception:
+                        continue
+                STATE[symbol]["history"].clear()
+                STATE[symbol]["history"].extend(restored[-5200:])
+                if restored:
+                    STATE[symbol]["price"] = restored[-1][1]
+            btc_rows = list(saved_price_history.get("BTC", []) or [])[-5200:]
+            btc_restored = []
+            for row in btc_rows:
+                try:
+                    ts, pr, qv = float(row[0]), float(row[1]), float(row[2] if len(row) > 2 else 0)
+                    if ts >= cutoff and pr > 0:
+                        btc_restored.append((ts, pr, qv))
+                except Exception:
+                    continue
+            MARKET_HISTORY["BTC"].clear()
+            MARKET_HISTORY["BTC"].extend(btc_restored[-5200:])
+
         with LOCK:
             for symbol in COINS:
                 if symbol in saved_ledger:
@@ -112,6 +143,15 @@ def save_persistent_state():
                     "saved_at": int(time.time()),
                 }
 
+        # v14.9: persist rolling WLD/KAIA/BTC price history so cumulative returns
+        # survive Render restart/redeploy. Snapshot is bounded to 5200 samples per asset.
+        with LOCK:
+            data["_price_history"] = {
+                "WLD": [list(x) for x in list(STATE["WLD"].get("history") or [])[-5200:]],
+                "KAIA": [list(x) for x in list(STATE["KAIA"].get("history") or [])[-5200:]],
+                "BTC": [list(x) for x in list(MARKET_HISTORY.get("BTC") or [])[-5200:]],
+            }
+
         # v13.4: persist only recent successful news entries.
         # Snapshot outside the trading LOCK to avoid coupling market state and news I/O.
         with NEWS_CACHE_LOCK:
@@ -159,11 +199,12 @@ STATE = {
     } for s in COINS
 }
 
-load_persistent_state()
-
 # ---------- v12.8 MARKET SHOCK + DEEP CAUSE SEARCH + SAFE REBUY FILTER ----------
 # BTC는 시장 전체 급변 여부를 판별하기 위한 참고 시세입니다. 자동주문에는 사용하지 않습니다.
 MARKET_HISTORY = {"BTC": deque(maxlen=5200)}
+
+# v14.9: price history is restored from persistent disk after all history containers exist.
+load_persistent_state()
 RAPID_LAST = {s:{"ts":0.0,"dir":""} for s in COINS}
 RAPID_COOLDOWN = 30 * 60
 RAPID_LOCK = threading.Lock()
@@ -1654,7 +1695,7 @@ def _cause_time_weight(age):
     return {"direct":8,"recent":3,"background":-7,"unknown":-4,"old":-12}.get(b,-12)
 
 
-# ---------- v14.8 CROSS-ASSET MARKET DATA CAUSE RADAR ----------
+# ---------- v14.9 CROSS-ASSET MARKET DATA CAUSE RADAR ----------
 def _yahoo_change(symbol, lookback_seconds=86400):
     """Best-effort public cross-asset snapshot; failure is isolated and never blocks /cause."""
     try:
@@ -1691,7 +1732,7 @@ def _liquidation_snapshot():
         return None
 
 def market_data_cause_radar(direction):
-    """v14.8: news-independent corroboration from yields, dollar, US equities and liquidations.
+    """v14.9: news-independent corroboration from yields, dollar, US equities and liquidations.
     It reports correlation/evidence, never asserts causality by itself.
     """
     syms={"미10년물":"%5ETNX","달러지수":"DX-Y.NYB","나스닥":"%5EIXIC","S&P500":"%5EGSPC"}
@@ -1906,13 +1947,13 @@ def market_cause_analysis_text(force_direction=None):
     if selected and selected[0][2]>=4: confidence+=10
     if selected and selected[0][7]>=2: confidence+=7
     if len(seen_cats)>=2: confidence+=5
-    # v14.8: cross-asset data can corroborate news, but cannot create a news cause by itself.
+    # v14.9: cross-asset data can corroborate news, but cannot create a news cause by itself.
     if selected and md_radar.get("score",0)>=3: confidence+=5
     if selected and md_radar.get("score",0)>=5: confidence+=5
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v14.8】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v14.9】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if news_collect_error:
         parts += ["⚠️ 실시간 뉴스 수집 오류를 격리하고 영구 캐시로 계속 분석", ""]
     if NEWS_HEALTH.get("last_errors",0):
@@ -1996,7 +2037,7 @@ def market_cause_worker(direction,cid):
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v14.8 급변 원인분석 테스트】\n\n"
+        "🧪 【v14.9 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
@@ -2023,7 +2064,7 @@ def causetest_text():
         "✅ 뉴스 오류여도 /cause 전체 fallback 방지\n"
         "✅ 0~12시간 직접원인 최우선 + 12~24시간 최근원인 차순위\n"
         "✅ 24~72시간 오래된 뉴스는 배경원인으로 분리\n"
-        "✅ 청산·ETF·나스닥·금리 현재 하락 전용검색 강화\n✅ v14.7 직접수집망 8개: CoinDesk/CNBC/Cointelegraph/Decrypt/Fed/BLS/SEC\n✅ 직접 RSS 최대4개 병렬 + 개별실패 캐시복구\n✅ 검색엔진 장애 시 공식 거시기관 RSS·영구증거풀 우선\n✅ v14.8 시장데이터 교차검증: 미10년물·DXY·나스닥·S&P500·BTC 청산\n✅ 뉴스 원인과 시장데이터 동조 시 신뢰도 가산, 데이터 단독 인과단정 금지\n\n"
+        "✅ 청산·ETF·나스닥·금리 현재 하락 전용검색 강화\n✅ v14.7 직접수집망 8개: CoinDesk/CNBC/Cointelegraph/Decrypt/Fed/BLS/SEC\n✅ 직접 RSS 최대4개 병렬 + 개별실패 캐시복구\n✅ 검색엔진 장애 시 공식 거시기관 RSS·영구증거풀 우선\n✅ v14.9 시장데이터 교차검증: 미10년물·DXY·나스닥·S&P500·BTC 청산\n✅ v14.9 누적 가격히스토리 영구저장·재배포 즉시복원(30분/1시간/4시간)\n✅ 뉴스 원인과 시장데이터 동조 시 신뢰도 가산, 데이터 단독 인과단정 금지\n\n"
         "※ 가상 테스트이며 가격·평단·수량·현금·장부는 변경하지 않습니다."
     )
 
@@ -2572,7 +2613,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v14.8 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v14.9 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
             elif text.startswith("/radar"):
                 send_long(event_radar_text(),cid)
             elif text.startswith("/sellqty"):
