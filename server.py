@@ -1653,6 +1653,84 @@ def _cause_time_weight(age):
     b=_cause_time_bucket(age)
     return {"direct":8,"recent":3,"background":-7,"unknown":-4,"old":-12}.get(b,-12)
 
+
+# ---------- v14.8 CROSS-ASSET MARKET DATA CAUSE RADAR ----------
+def _yahoo_change(symbol, lookback_seconds=86400):
+    """Best-effort public cross-asset snapshot; failure is isolated and never blocks /cause."""
+    try:
+        url=f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        r=SESSION.get(url,params={"range":"5d","interval":"5m","includePrePost":"true"},
+                      headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/14.8"},timeout=(2.5,4.5))
+        r.raise_for_status(); result=(r.json().get("chart",{}).get("result") or [None])[0]
+        if not result: return None
+        ts=result.get("timestamp") or []; close=((result.get("indicators",{}).get("quote") or [{}])[0].get("close") or [])
+        pts=[(int(t),safe_float(c,None)) for t,c in zip(ts,close) if c is not None and safe_float(c,None) is not None]
+        if len(pts)<2: return None
+        now_t,now_v=pts[-1]; target=now_t-lookback_seconds
+        old=min(pts,key=lambda x:abs(x[0]-target))[1]
+        return {"value":now_v,"change":pct(now_v,old),"ts":now_t}
+    except Exception:
+        return None
+
+def _liquidation_snapshot():
+    """Best-effort BTC liquidation pulse from a no-key public feed; optional evidence only."""
+    try:
+        r=SESSION.get("https://marginpad.io/api/v1/liquidations/recent",params={"symbol":"BTC","minutes":"60"},
+                      headers={"User-Agent":"JainaCoinMonitor/14.8"},timeout=(2.5,4.5))
+        r.raise_for_status(); j=r.json()
+        # tolerate several plausible response shapes
+        rows=j.get("data") or j.get("buckets") or j.get("items") or j.get("liquidations") or []
+        if isinstance(rows,dict): rows=rows.get("buckets") or rows.get("items") or []
+        longs=shorts=0.0
+        for x in rows if isinstance(rows,list) else []:
+            longs += safe_float(x.get("long") or x.get("longs") or x.get("long_liquidated") or x.get("long_notional"))
+            shorts += safe_float(x.get("short") or x.get("shorts") or x.get("short_liquidated") or x.get("short_notional"))
+        if longs<=0 and shorts<=0: return None
+        return {"long":longs,"short":shorts}
+    except Exception:
+        return None
+
+def market_data_cause_radar(direction):
+    """v14.8: news-independent corroboration from yields, dollar, US equities and liquidations.
+    It reports correlation/evidence, never asserts causality by itself.
+    """
+    syms={"미10년물":"%5ETNX","달러지수":"DX-Y.NYB","나스닥":"%5EIXIC","S&P500":"%5EGSPC"}
+    data={}
+    def one(k,v): return k,_yahoo_change(v,86400)
+    try:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            for f in as_completed([ex.submit(one,k,v) for k,v in syms.items()]):
+                try:
+                    k,val=f.result(); data[k]=val
+                except Exception: pass
+    except Exception: pass
+    liq=_liquidation_snapshot()
+    score=0; signals=[]
+    if direction=="DOWN":
+        if data.get("미10년물") and data["미10년물"]["change"]>=0.35: score+=2; signals.append("미 국채금리 상승")
+        if data.get("달러지수") and data["달러지수"]["change"]>=0.25: score+=2; signals.append("달러 강세")
+        if data.get("나스닥") and data["나스닥"]["change"]<=-0.7: score+=2; signals.append("나스닥 약세")
+        if data.get("S&P500") and data["S&P500"]["change"]<=-0.5: score+=1; signals.append("S&P500 약세")
+        if liq and liq["long"]>max(liq["short"]*1.5,1000000): score+=2; signals.append("BTC 롱청산 우세")
+    else:
+        if data.get("미10년물") and data["미10년물"]["change"]<=-0.35: score+=2; signals.append("미 국채금리 하락")
+        if data.get("달러지수") and data["달러지수"]["change"]<=-0.25: score+=2; signals.append("달러 약세")
+        if data.get("나스닥") and data["나스닥"]["change"]>=0.7: score+=2; signals.append("나스닥 강세")
+        if data.get("S&P500") and data["S&P500"]["change"]>=0.5: score+=1; signals.append("S&P500 강세")
+        if liq and liq["short"]>max(liq["long"]*1.5,1000000): score+=2; signals.append("BTC 숏청산 우세")
+    return {"score":score,"signals":signals,"data":data,"liq":liq,"available":sum(v is not None for v in data.values())+(1 if liq else 0)}
+
+def _market_data_text(md):
+    if not md or not md.get("available"): return "📊 시장데이터 교차검증: 현재 외부 데이터 연결 실패 — 뉴스 판단에는 영향 없음"
+    bits=[]
+    for k in ("미10년물","달러지수","나스닥","S&P500"):
+        x=md.get("data",{}).get(k)
+        if x: bits.append(f"{k} {x['change']:+.2f}%")
+    liq=md.get("liq")
+    if liq: bits.append(f"BTC 1h 청산 롱 ${liq['long']/1e6:.1f}M / 숏 ${liq['short']/1e6:.1f}M")
+    sig=", ".join(md.get("signals") or []) or "뚜렷한 동조 신호 없음"
+    return "📊 시장데이터 교차검증\n• "+" · ".join(bits)+f"\n• 동조 신호: {sig} (점수 {md.get('score',0)}/9)"
+
 def market_cause_analysis_text(force_direction=None):
     """v13.8: 실시간 검색 실패 시에도 영구 거시 증거풀을 병합해 직접 원인을 최대한 복원한다."""
     move=market_move_snapshot(); btc=move.get("BTC",{})
@@ -1673,6 +1751,7 @@ def market_cause_analysis_text(force_direction=None):
         vals=[move.get(s,{}).get("ret5") for s in ("WLD","KAIA") if move.get(s,{}).get("ret5") is not None]
         direction="UP" if (sum(vals)/len(vals) if vals else 0)>=0 else "DOWN"
 
+    md_radar=market_data_cause_radar(direction)
     expected=1 if direction=="UP" else -1
     ranked=[]; rejected_opposite=0; rejected_stale_price=0
     # v13.8: 뉴스 수집 예외가 /cause 전체를 죽이지 않도록 완전 격리.
@@ -1827,15 +1906,19 @@ def market_cause_analysis_text(force_direction=None):
     if selected and selected[0][2]>=4: confidence+=10
     if selected and selected[0][7]>=2: confidence+=7
     if len(seen_cats)>=2: confidence+=5
+    # v14.8: cross-asset data can corroborate news, but cannot create a news cause by itself.
+    if selected and md_radar.get("score",0)>=3: confidence+=5
+    if selected and md_radar.get("score",0)>=5: confidence+=5
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v14.7】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v14.8】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if news_collect_error:
         parts += ["⚠️ 실시간 뉴스 수집 오류를 격리하고 영구 캐시로 계속 분석", ""]
     if NEWS_HEALTH.get("last_errors",0):
         parts.append(f"⚠️ 뉴스 연결 일부 지연 {NEWS_HEALTH['last_errors']}건 — 확보 기사 {NEWS_HEALTH.get('last_ok',0)}건으로 계속 분석")
         parts.append("")
+    parts += [_market_data_text(md_radar), ""]
     if emergency_used and selected:
         parts += ["🛟 일반 검색 근거 부족 → 지속하락 원인 전용 긴급검색·영구캐시 복구 성공", ""]
     elif emergency_used and not selected and background_pool:
@@ -1913,7 +1996,7 @@ def market_cause_worker(direction,cid):
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v13.8 급변 원인분석 테스트】\n\n"
+        "🧪 【v14.8 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
@@ -1940,7 +2023,7 @@ def causetest_text():
         "✅ 뉴스 오류여도 /cause 전체 fallback 방지\n"
         "✅ 0~12시간 직접원인 최우선 + 12~24시간 최근원인 차순위\n"
         "✅ 24~72시간 오래된 뉴스는 배경원인으로 분리\n"
-        "✅ 청산·ETF·나스닥·금리 현재 하락 전용검색 강화\n✅ v14.7 직접수집망 8개: CoinDesk/CNBC/Cointelegraph/Decrypt/Fed/BLS/SEC\n✅ 직접 RSS 최대4개 병렬 + 개별실패 캐시복구\n✅ 검색엔진 장애 시 공식 거시기관 RSS·영구증거풀 우선\n\n"
+        "✅ 청산·ETF·나스닥·금리 현재 하락 전용검색 강화\n✅ v14.7 직접수집망 8개: CoinDesk/CNBC/Cointelegraph/Decrypt/Fed/BLS/SEC\n✅ 직접 RSS 최대4개 병렬 + 개별실패 캐시복구\n✅ 검색엔진 장애 시 공식 거시기관 RSS·영구증거풀 우선\n✅ v14.8 시장데이터 교차검증: 미10년물·DXY·나스닥·S&P500·BTC 청산\n✅ 뉴스 원인과 시장데이터 동조 시 신뢰도 가산, 데이터 단독 인과단정 금지\n\n"
         "※ 가상 테스트이며 가격·평단·수량·현금·장부는 변경하지 않습니다."
     )
 
@@ -2489,7 +2572,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v14.7 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v14.8 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
             elif text.startswith("/radar"):
                 send_long(event_radar_text(),cid)
             elif text.startswith("/sellqty"):
