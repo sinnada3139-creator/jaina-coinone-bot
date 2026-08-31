@@ -167,7 +167,7 @@ MARKET_HISTORY = {"BTC": deque(maxlen=5200)}
 RAPID_LAST = {s:{"ts":0.0,"dir":""} for s in COINS}
 RAPID_COOLDOWN = 30 * 60
 RAPID_LOCK = threading.Lock()
-# v14.6: 순간 임계치 미도달이어도 지속 하락+추세 붕괴를 별도 감지
+# v14.7: 순간 임계치 미도달이어도 지속 하락+추세 붕괴를 별도 감지
 SUSTAINED_LAST = {s:{"ts":0.0} for s in COINS}
 SUSTAINED_COOLDOWN = 60 * 60
 MARKET_CAUSE_LAST = {"ts":0.0,"dir":""}
@@ -926,7 +926,7 @@ def monitor_loop():
                 if s not in COINS:
                     continue
                 d=strategy(s,tick)
-                # v14.6: 순간/누적 급변뿐 아니라 지속 하락+15분/4시간 추세 붕괴도 중요 원인알람
+                # v14.7: 순간/누적 급변뿐 아니라 지속 하락+15분/4시간 추세 붕괴도 중요 원인알람
                 sustained = CHAT_ID and sustained_decline_triggered(s,d)
                 rapid = CHAT_ID and rapid_triggered(s,d)
                 if sustained or rapid:
@@ -1296,25 +1296,40 @@ def bing_news_rss(query, limit=6):
 
 
 def direct_crypto_feeds(limit=10):
-    """v13.0 보조 경로: 검색엔진을 거치지 않는 직접 금융/크립토 RSS."""
+    """v14.7: 검색엔진 독립 직접 수집망. 개별 실패 격리 + 병렬수집 + 영구캐시."""
     feeds=[
         ("CoinDesk","https://www.coindesk.com/arc/outboundfeeds/rss/"),
         ("CNBC","https://www.cnbc.com/id/10000664/device/rss/rss.html"),
-        # v13.8: 검색엔진 장애와 독립된 추가 금융 피드. 실패해도 다른 피드는 계속 동작.
         ("CNBC Markets","https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+        ("Cointelegraph","https://cointelegraph.com/rss"),
+        ("Decrypt","https://decrypt.co/feed"),
+        ("Federal Reserve","https://www.federalreserve.gov/feeds/press_all.xml"),
+        ("BLS","https://www.bls.gov/feed/bls_latest.rss"),
+        ("SEC","https://www.sec.gov/news/pressreleases.rss"),
     ]
-    out=[]
-    for source,url in feeds:
-        key="feed::"+source
+    def one(row):
+        source,url=row; key="feed::"+source
         try:
-            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.8"},timeout=(2.5,5.0))
+            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/14.7"},timeout=(2.2,4.5))
             r.raise_for_status()
             items=_parse_rss_items(r.content,limit,source)
-            _news_cache_put(key,items)
-            _macro_pool_put(items)
-            out.extend(items)
+            if items:
+                _news_cache_put(key,items); _macro_pool_put(items)
+                return items, True
         except Exception:
-            out.extend(_news_cache_get(key,limit,True))
+            pass
+        return _news_cache_get(key,limit,True), False
+    out=[]; ok=0
+    # 직렬 8개 timeout을 피하고 최대 4개씩 병렬 처리한다.
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs=[ex.submit(one,row) for row in feeds]
+        for f in as_completed(futs):
+            try:
+                items,live=f.result(); out.extend(items or []); ok += 1 if live else 0
+            except Exception:
+                pass
+    NEWS_HEALTH["direct_live_ok"]=ok
+    NEWS_HEALTH["direct_feed_total"]=len(feeds)
     return _dedupe_news(out)
 
 
@@ -1627,7 +1642,7 @@ def _v133_stale_btc_price_title(title, btc_krw):
     return False, ""
 
 def _cause_time_bucket(age):
-    """v14.6: 현재 하락 직접원인과 오래된 배경원인을 시간축으로 분리."""
+    """v14.7: 현재 하락 직접원인과 오래된 배경원인을 시간축으로 분리."""
     if age is None or age >= 999: return "unknown"
     if age <= 12: return "direct"
     if age <= 24: return "recent"
@@ -1673,7 +1688,7 @@ def market_cause_analysis_text(force_direction=None):
             macro_items = []
         if not macro_items:
             recovered=[]
-            for _k in ("feed::CoinDesk","feed::CNBC","feed::CNBC Markets"):
+            for _k in ("feed::CoinDesk","feed::CNBC","feed::CNBC Markets","feed::Cointelegraph","feed::Decrypt","feed::Federal Reserve","feed::BLS","feed::SEC"):
                 try: recovered.extend(_news_cache_get(_k,12,True))
                 except Exception: pass
             macro_items=_dedupe_news(recovered)
@@ -1722,7 +1737,7 @@ def market_cause_analysis_text(force_direction=None):
                 selected.append(row); seen_cats.add(cat)
             if len(selected)>=3: break
 
-    # v14.6: 지속하락/강제 DOWN 분석인데 1순위 근거가 비면 원인 전용 긴급검색을 한 번 더 수행한다.
+    # v14.7: 지속하락/강제 DOWN 분석인데 1순위 근거가 비면 원인 전용 긴급검색을 한 번 더 수행한다.
     # 일반 뉴스검색과 분리해 연준·금리/국채·달러/청산·옵션/ETF/규제·지정학을 직접 겨냥한다.
     emergency_used=False
     background_pool=[]
@@ -1786,7 +1801,7 @@ def market_cause_analysis_text(force_direction=None):
             if total>=9 and (ds>0 or direct>=2):
                 eranked.append((total,ds,sourceq,freshness,cat,age,it,direct,5 if forecast else 0,polarity,catsupport))
         eranked.sort(key=lambda x:(x[0],x[2],x[7],-x[5]),reverse=True)
-        # v14.6: 0~12h 직접원인 > 12~24h 최근원인 > 24~72h 배경원인.
+        # v14.7: 0~12h 직접원인 > 12~24h 최근원인 > 24~72h 배경원인.
         # 오래된 배경뉴스가 오늘 하락의 1순위 직접원인으로 승격되지 않게 한다.
         primary_pool=[r for r in eranked if _cause_time_bucket(r[5]) in ("direct","recent")]
         background_pool=[r for r in eranked if _cause_time_bucket(r[5])=="background"]
@@ -1815,7 +1830,7 @@ def market_cause_analysis_text(force_direction=None):
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v14.6】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v14.7】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if news_collect_error:
         parts += ["⚠️ 실시간 뉴스 수집 오류를 격리하고 영구 캐시로 계속 분석", ""]
     if NEWS_HEALTH.get("last_errors",0):
@@ -1925,7 +1940,7 @@ def causetest_text():
         "✅ 뉴스 오류여도 /cause 전체 fallback 방지\n"
         "✅ 0~12시간 직접원인 최우선 + 12~24시간 최근원인 차순위\n"
         "✅ 24~72시간 오래된 뉴스는 배경원인으로 분리\n"
-        "✅ 청산·ETF·나스닥·금리 현재 하락 전용검색 강화\n\n"
+        "✅ 청산·ETF·나스닥·금리 현재 하락 전용검색 강화\n✅ v14.7 직접수집망 8개: CoinDesk/CNBC/Cointelegraph/Decrypt/Fed/BLS/SEC\n✅ 직접 RSS 최대4개 병렬 + 개별실패 캐시복구\n✅ 검색엔진 장애 시 공식 거시기관 RSS·영구증거풀 우선\n\n"
         "※ 가상 테스트이며 가격·평단·수량·현금·장부는 변경하지 않습니다."
     )
 
@@ -2042,7 +2057,7 @@ def rapid_cause_text(symbol, d):
 
 
 def sustained_decline_status(symbol,d):
-    """v14.6: 누적봉이 0이어도 기존 일간/고점/추세 데이터로 지속하락 상태를 직접 판정."""
+    """v14.7: 누적봉이 0이어도 기존 일간/고점/추세 데이터로 지속하락 상태를 직접 판정."""
     daily=d.get("daily",{}) or {}
     prev=safe_float(daily.get("prev24_change_pct")) if daily.get("ready") else 0.0
     today=safe_float(daily.get("today_change_pct")) if daily.get("ready") else 0.0
@@ -2091,7 +2106,7 @@ def rapid_triggered(symbol,d):
 def rapid_cause_worker(symbol,d,cid):
     try:
         with RAPID_LOCK:
-            # v14.6: 지속하락 트리거는 BTC 단기 반등과 무관하게 하락 원인으로 고정
+            # v14.7: 지속하락 트리거는 BTC 단기 반등과 무관하게 하락 원인으로 고정
             if d.get("sustained_decline"):
                 send_long(rapid_cause_text(symbol,d),cid)
                 send_long(market_cause_analysis_text("DOWN"),cid)
@@ -2121,7 +2136,7 @@ def rapid_cause_report_text():
     m=market_move_snapshot().get("BTC",{})
     parts.append(f"\nBTC 참고: 1분 {(m.get('ret1') or 0):+.2f}% · 5분 {(m.get('ret5') or 0):+.2f}% · 30분 {(m.get('ret30') or 0):+.2f}% · 1시간 {(m.get('ret60') or 0):+.2f}% · 4시간 {(m.get('ret4h') or 0):+.2f}%")
     parts.append("※ 자동알림: 순간급변 + 30분·1시간·4시간 누적 급등락 동시 감시")
-    # v14.6: WLD/KAIA 중 하나라도 지속하락이면 수동 /cause도 하락 방향으로 분석
+    # v14.7: WLD/KAIA 중 하나라도 지속하락이면 수동 /cause도 하락 방향으로 분석
     sustained_any = any(
         sustained_decline_status(sym, snap.get(sym))[0]
         for sym in ("WLD", "KAIA") if snap.get(sym)
@@ -2349,7 +2364,7 @@ def run_enginetest(cid):
     header="✅ v11 판단엔진 전체 통과" if all_ok else "❌ v11 판단엔진 일부 실패"
     send(header+"\n\n"+"\n\n".join(lines),cid)
 
-# ---------- v14.6 PRE-EVENT MARKET RADAR + SUSTAINED DECLINE ALERT ----------
+# ---------- v14.7 PRE-EVENT MARKET RADAR + SUSTAINED DECLINE ALERT ----------
 EVENT_RADAR_INTERVAL = 15 * 60
 EVENT_RADAR_LAST_DAILY = ""
 EVENT_RADAR_SENT = set()
@@ -2474,7 +2489,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v14.6 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v14.7 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
             elif text.startswith("/radar"):
                 send_long(event_radar_text(),cid)
             elif text.startswith("/sellqty"):
