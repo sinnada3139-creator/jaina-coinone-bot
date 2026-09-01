@@ -477,6 +477,10 @@ def move_mark(v):
 
 TREND_CACHE = {}
 TREND_CACHE_TTL = 60
+VOLUME_CACHE = {}
+VOLUME_CACHE_TTL = 45
+VOLUME_ALERT_LAST = {"WLD": {"level": 0, "ts": 0.0}, "KAIA": {"level": 0, "ts": 0.0}}
+VOLUME_ALERT_COOLDOWN = 17 * 60
 
 def ema(values, period):
     if not values: return 0.0
@@ -529,6 +533,47 @@ def timeframe_metrics(rows):
     return {"ready":True,"price":closes[-1],"ema20":e20,"ema60":e60,"ema_bull":e20>e60,
             "slope":slope,"rsi":rv,"macd":m,"macd_signal":ms,"macd_hist":mh,
             "macd_bull":m>ms,"hh":hh,"hl":hl,"vol_ratio":vr}
+
+def volume_analysis(symbol):
+    """v15.0 strategic volume radar: 5m acceleration + 15m acceleration + rolling 24h vs prior 24h."""
+    now=time.time(); cached=VOLUME_CACHE.get(symbol)
+    if cached and now-cached.get("ts",0)<VOLUME_CACHE_TTL: return cached["data"]
+    try:
+        one=fetch_chart(symbol,"1m",120)
+        hour=fetch_chart(symbol,"1h",60)
+        v1=[safe_float(x.get("quote_volume")) for x in one if safe_float(x.get("quote_volume"))>=0]
+        vh=[safe_float(x.get("quote_volume")) for x in hour if safe_float(x.get("quote_volume"))>=0]
+        if len(v1)<45 or len(vh)<48: raise RuntimeError("거래량 캔들 데이터 부족")
+        v5=sum(v1[-5:]); base5=(sum(v1[-35:-5])/30.0)*5.0
+        v15=sum(v1[-15:]); base15=(sum(v1[-45:-15])/30.0)*15.0
+        r5=v5/base5 if base5>0 else 1.0
+        r15=v15/base15 if base15>0 else 1.0
+        cur24=sum(vh[-24:]); prev24=sum(vh[-48:-24]); r24=cur24/prev24 if prev24>0 else 1.0
+        pct24=(r24-1.0)*100.0
+        level=3 if (r5>=3.0 or r15>=3.0 or r24>=3.0) else (2 if (r5>=2.0 or r15>=2.0 or r24>=2.0) else (1 if (r5>=1.5 or r15>=1.5 or r24>=1.5) else 0))
+        data={"ready":True,"r5":r5,"r15":r15,"r24":r24,"pct24":pct24,"level":level}
+    except Exception as e:
+        data={"ready":False,"r5":1.0,"r15":1.0,"r24":1.0,"pct24":0.0,"level":0,"error":str(e)}
+    VOLUME_CACHE[symbol]={"ts":now,"data":data}; return data
+
+def volume_alert_text(symbol,d):
+    v=d.get("volume",{}) or {}; move=d.get("ret5m",0.0)
+    if move>=1.0: flow="🟢 가격상승 + 거래량급증 → 매수세/돌파 신뢰 강화"
+    elif move<=-1.0: flow="🔴 가격하락 + 거래량급증 → 투매/대량매도 가능성"
+    else: flow="⚡ 가격 선행 거래량 급증 → 수급 변화 선행 가능성"
+    return (f"🚨 【{symbol} 전략적 거래량 중요알림】\n"
+            f"현재가 {d.get('price',0):,.4f}원 · 5분 {move:+.2f}%\n"
+            f"5분 거래량 {v.get('r5',1):.2f}배 · 15분 {v.get('r15',1):.2f}배\n"
+            f"최근24시간/직전24시간 {v.get('r24',1):.2f}배 ({v.get('pct24',0):+.0f}%)\n"
+            f"{flow}\n🔎 중요 뉴스·원인 레이다 연동")
+
+def volume_alert_triggered(symbol,d):
+    v=d.get("volume",{}) or {}; level=int(v.get("level",0) or 0)
+    if not v.get("ready") or level<2: return False
+    now=time.time(); last=VOLUME_ALERT_LAST[symbol]
+    # 2x=important, 3x=high. Escalation bypasses cooldown; otherwise suppress duplicates for 17m.
+    if level<=last.get("level",0) and now-last.get("ts",0)<VOLUME_ALERT_COOLDOWN: return False
+    last["level"]=level; last["ts"]=now; return True
 
 def trend_analysis(symbol):
     now=time.time(); cached=TREND_CACHE.get(symbol)
@@ -671,6 +716,7 @@ def strategy(symbol, tick):
         phase="관찰"
         trend=trend_analysis(symbol)
         daily=daily_reference(symbol,p)
+        volume=volume_analysis(symbol)
 
         # 0) 급락 방어가 최우선
         if price_dd<=-25:
@@ -823,6 +869,7 @@ def strategy(symbol, tick):
             "ret1h":ret60,
             "ret4h":ret4h,
             "vol_ratio":vol_ratio,
+            "volume":volume,
             "signal":signal,
             "score":score,
             "reason":reason,
@@ -885,7 +932,8 @@ def alert_text(symbol,d):
         f"평단대비 {d['gain_pct']:+.2f}%\n"
         f"고점대비 {d['drawdown_pct']:+.2f}%\n"
         f"1분 {d['ret1m']:+.2f}% / 5분 {d['ret5m']:+.2f}%\n"
-        f"거래량비 {d['vol_ratio']:.2f}배\n"
+        f"거래량 5분 {d.get('volume',{}).get('r5',d['vol_ratio']):.2f}배 · 15분 {d.get('volume',{}).get('r15',1):.2f}배\n"
+        f"24시간 거래량 직전24h 대비 {d.get('volume',{}).get('pct24',0):+.0f}% ({d.get('volume',{}).get('r24',1):.2f}배)\n"
         f"📈 추세신뢰도 {d.get('trend',{}).get('score',0)}/100 · {d.get('trend',{}).get('label','⚪ 확인중')}\n"
         f"단기(15분봉) EMA20/60 {'🟢' if d.get('trend',{}).get('short',{}).get('ema_bull') else '🔴'} · RSI {d.get('trend',{}).get('short',{}).get('rsi',50):.1f} · MACD {'🟢' if d.get('trend',{}).get('short',{}).get('macd_bull') else '🔴'}\n"
         f"중기(4시간봉) EMA20/60 {'🟢' if d.get('trend',{}).get('mid',{}).get('ema_bull') else '🔴'} · RSI {d.get('trend',{}).get('mid',{}).get('rsi',50):.1f} · MACD {'🟢' if d.get('trend',{}).get('mid',{}).get('macd_bull') else '🔴'}\n"
@@ -926,6 +974,11 @@ def monitor_loop():
                 if s not in COINS:
                     continue
                 d=strategy(s,tick)
+                # v15.0: volume can lead price, so alert before price thresholds are reached.
+                if CHAT_ID and volume_alert_triggered(s,d):
+                    send(volume_alert_text(s,d),CHAT_ID)
+                    if d.get("ret5m",0)>=1.0 or d.get("ret5m",0)<=-1.0:
+                        threading.Thread(target=rapid_cause_worker,args=(s,dict(d),CHAT_ID),daemon=True).start()
                 # v14.6: 순간/누적 급변뿐 아니라 지속 하락+15분/4시간 추세 붕괴도 중요 원인알람
                 sustained = CHAT_ID and sustained_decline_triggered(s,d)
                 rapid = CHAT_ID and rapid_triggered(s,d)
@@ -2331,6 +2384,7 @@ def engine_test_results():
         results.append({
             "name":name,"gain":gain,"price_dd":price_dd,"profit_dd":profit_dd,
             "score":score,"ret1":ret1,"ret5":ret5,"vol_ratio":vol_ratio,
+            "volume":volume,
             "expected":expected,"actual":actual,"ok":ok
         })
     return all_ok,results
