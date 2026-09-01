@@ -2329,6 +2329,23 @@ def run_signaltest(cid):
 
 
 
+
+def run_voltest(cid):
+    """v15.1: strategic volume alert dry-run. No portfolio/order/state mutation."""
+    send("🧪 /voltest — 전략적 거래량 중요알림 테스트 시작\n※ 실제 주문·보유수량·현금·최고수익 값은 변경하지 않습니다.", cid)
+    cases=[
+        ("KAIA",40.83,0.80,3.50,2.40,2.80),
+        ("WLD",1000.00,-2.20,4.20,3.10,1.70),
+    ]
+    for symbol,price,move,r5,r15,r24 in cases:
+        d={
+            "price":price,"ret5m":move,
+            "volume":{"ready":True,"r5":r5,"r15":r15,"r24":r24,"pct24":(r24-1)*100,"level":3}
+        }
+        send("【테스트 — 실제 신호 아님】\n"+volume_alert_text(symbol,d),cid)
+        time.sleep(0.5)
+    send("✅ /voltest 완료\nKAIA 선행수급 + WLD 하락투매 2개 알림이 모두 도착하면 거래량 중요알림 표시 기능 통과.\n※ 실시간 Coinone 캔들 수집 자체는 /status의 5분·15분·24시간 거래량 수치로 별도 확인합니다.",cid)
+
 def evaluate_test_case(gain, price_dd, profit_dd, score, ret1=0.0, ret5=0.0, vol_ratio=1.0):
     # strategy() 핵심 우선순위와 동일하게 테스트
     if price_dd <= -25:
@@ -2625,7 +2642,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v14.6 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/lead WLD·KAIA 선행호재 레이다\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v15.1 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/lead WLD·KAIA 선행호재 레이다\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/voltest 거래량 중요알림 테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
             elif text.startswith("/lead"):
                 send_long(leading_catalyst_text(),cid)
             elif text.startswith("/radar"):
@@ -2724,7 +2741,7 @@ def telegram_loop():
                     print("[Telegram] /trend error", repr(e), flush=True)
                     send(f"⚠️ 추세 조회 오류: {type(e).__name__}: {e}", cid)
             elif text.split()[0].split("@")[0].lower() == "/version" if text else False:
-                send("✅ Jaina Coin Monitor v12.3 실행 중", cid)
+                send("✅ Jaina Coin Monitor v15.1 실행 중", cid)
             elif text.split()[0].split("@")[0].lower() == "/booktest" if text else False:
                 # 먼저 수신 확인을 보내므로, 긴 테스트 전에 명령 수신 여부를 즉시 알 수 있다.
                 send("🧪 /booktest 명령 수신 — 장부 무변경 안전 테스트 시작", cid)
@@ -2737,6 +2754,8 @@ def telegram_loop():
                     send(f"⚠️ 장부 테스트 실패: {type(e).__name__}: {e}",cid)
             elif text.startswith("/enginetest"):
                 run_enginetest(cid)
+            elif text.startswith("/voltest"):
+                run_voltest(cid)
             elif text.startswith("/signaltest"):
                 run_signaltest(cid)
             elif text.startswith("/autotest"):
