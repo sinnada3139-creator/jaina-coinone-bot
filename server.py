@@ -62,37 +62,6 @@ def load_persistent_state():
                 except Exception:
                     continue
 
-        # v14.9: restore up to ~4h+ of WLD/KAIA/BTC price history.
-        # Keep original sampling timestamps so 30m/1h/4h returns work immediately after redeploy.
-        saved_price_history = saved.get("_price_history", {}) or {}
-        cutoff = now_ts - (5 * 3600)
-        with LOCK:
-            for symbol in COINS:
-                rows = list(saved_price_history.get(symbol, []) or [])[-5200:]
-                restored = []
-                for row in rows:
-                    try:
-                        ts, pr, qv = float(row[0]), float(row[1]), float(row[2] if len(row) > 2 else 0)
-                        if ts >= cutoff and pr > 0:
-                            restored.append((ts, pr, qv))
-                    except Exception:
-                        continue
-                STATE[symbol]["history"].clear()
-                STATE[symbol]["history"].extend(restored[-5200:])
-                if restored:
-                    STATE[symbol]["price"] = restored[-1][1]
-            btc_rows = list(saved_price_history.get("BTC", []) or [])[-5200:]
-            btc_restored = []
-            for row in btc_rows:
-                try:
-                    ts, pr, qv = float(row[0]), float(row[1]), float(row[2] if len(row) > 2 else 0)
-                    if ts >= cutoff and pr > 0:
-                        btc_restored.append((ts, pr, qv))
-                except Exception:
-                    continue
-            MARKET_HISTORY["BTC"].clear()
-            MARKET_HISTORY["BTC"].extend(btc_restored[-5200:])
-
         with LOCK:
             for symbol in COINS:
                 if symbol in saved_ledger:
@@ -143,15 +112,6 @@ def save_persistent_state():
                     "saved_at": int(time.time()),
                 }
 
-        # v14.9: persist rolling WLD/KAIA/BTC price history so cumulative returns
-        # survive Render restart/redeploy. Snapshot is bounded to 5200 samples per asset.
-        with LOCK:
-            data["_price_history"] = {
-                "WLD": [list(x) for x in list(STATE["WLD"].get("history") or [])[-5200:]],
-                "KAIA": [list(x) for x in list(STATE["KAIA"].get("history") or [])[-5200:]],
-                "BTC": [list(x) for x in list(MARKET_HISTORY.get("BTC") or [])[-5200:]],
-            }
-
         # v13.4: persist only recent successful news entries.
         # Snapshot outside the trading LOCK to avoid coupling market state and news I/O.
         with NEWS_CACHE_LOCK:
@@ -199,16 +159,15 @@ STATE = {
     } for s in COINS
 }
 
+load_persistent_state()
+
 # ---------- v12.8 MARKET SHOCK + DEEP CAUSE SEARCH + SAFE REBUY FILTER ----------
 # BTC는 시장 전체 급변 여부를 판별하기 위한 참고 시세입니다. 자동주문에는 사용하지 않습니다.
 MARKET_HISTORY = {"BTC": deque(maxlen=5200)}
-
-# v14.9: price history is restored from persistent disk after all history containers exist.
-load_persistent_state()
 RAPID_LAST = {s:{"ts":0.0,"dir":""} for s in COINS}
 RAPID_COOLDOWN = 30 * 60
 RAPID_LOCK = threading.Lock()
-# v14.7: 순간 임계치 미도달이어도 지속 하락+추세 붕괴를 별도 감지
+# v14.6: 순간 임계치 미도달이어도 지속 하락+추세 붕괴를 별도 감지
 SUSTAINED_LAST = {s:{"ts":0.0} for s in COINS}
 SUSTAINED_COOLDOWN = 60 * 60
 MARKET_CAUSE_LAST = {"ts":0.0,"dir":""}
@@ -967,7 +926,7 @@ def monitor_loop():
                 if s not in COINS:
                     continue
                 d=strategy(s,tick)
-                # v14.7: 순간/누적 급변뿐 아니라 지속 하락+15분/4시간 추세 붕괴도 중요 원인알람
+                # v14.6: 순간/누적 급변뿐 아니라 지속 하락+15분/4시간 추세 붕괴도 중요 원인알람
                 sustained = CHAT_ID and sustained_decline_triggered(s,d)
                 rapid = CHAT_ID and rapid_triggered(s,d)
                 if sustained or rapid:
@@ -1337,40 +1296,25 @@ def bing_news_rss(query, limit=6):
 
 
 def direct_crypto_feeds(limit=10):
-    """v14.7: 검색엔진 독립 직접 수집망. 개별 실패 격리 + 병렬수집 + 영구캐시."""
+    """v13.0 보조 경로: 검색엔진을 거치지 않는 직접 금융/크립토 RSS."""
     feeds=[
         ("CoinDesk","https://www.coindesk.com/arc/outboundfeeds/rss/"),
         ("CNBC","https://www.cnbc.com/id/10000664/device/rss/rss.html"),
+        # v13.8: 검색엔진 장애와 독립된 추가 금융 피드. 실패해도 다른 피드는 계속 동작.
         ("CNBC Markets","https://www.cnbc.com/id/100003114/device/rss/rss.html"),
-        ("Cointelegraph","https://cointelegraph.com/rss"),
-        ("Decrypt","https://decrypt.co/feed"),
-        ("Federal Reserve","https://www.federalreserve.gov/feeds/press_all.xml"),
-        ("BLS","https://www.bls.gov/feed/bls_latest.rss"),
-        ("SEC","https://www.sec.gov/news/pressreleases.rss"),
     ]
-    def one(row):
-        source,url=row; key="feed::"+source
+    out=[]
+    for source,url in feeds:
+        key="feed::"+source
         try:
-            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/14.7"},timeout=(2.2,4.5))
+            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.8"},timeout=(2.5,5.0))
             r.raise_for_status()
             items=_parse_rss_items(r.content,limit,source)
-            if items:
-                _news_cache_put(key,items); _macro_pool_put(items)
-                return items, True
+            _news_cache_put(key,items)
+            _macro_pool_put(items)
+            out.extend(items)
         except Exception:
-            pass
-        return _news_cache_get(key,limit,True), False
-    out=[]; ok=0
-    # 직렬 8개 timeout을 피하고 최대 4개씩 병렬 처리한다.
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futs=[ex.submit(one,row) for row in feeds]
-        for f in as_completed(futs):
-            try:
-                items,live=f.result(); out.extend(items or []); ok += 1 if live else 0
-            except Exception:
-                pass
-    NEWS_HEALTH["direct_live_ok"]=ok
-    NEWS_HEALTH["direct_feed_total"]=len(feeds)
+            out.extend(_news_cache_get(key,limit,True))
     return _dedupe_news(out)
 
 
@@ -1683,7 +1627,7 @@ def _v133_stale_btc_price_title(title, btc_krw):
     return False, ""
 
 def _cause_time_bucket(age):
-    """v14.7: 현재 하락 직접원인과 오래된 배경원인을 시간축으로 분리."""
+    """v14.6: 현재 하락 직접원인과 오래된 배경원인을 시간축으로 분리."""
     if age is None or age >= 999: return "unknown"
     if age <= 12: return "direct"
     if age <= 24: return "recent"
@@ -1693,84 +1637,6 @@ def _cause_time_bucket(age):
 def _cause_time_weight(age):
     b=_cause_time_bucket(age)
     return {"direct":8,"recent":3,"background":-7,"unknown":-4,"old":-12}.get(b,-12)
-
-
-# ---------- v14.9 CROSS-ASSET MARKET DATA CAUSE RADAR ----------
-def _yahoo_change(symbol, lookback_seconds=86400):
-    """Best-effort public cross-asset snapshot; failure is isolated and never blocks /cause."""
-    try:
-        url=f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        r=SESSION.get(url,params={"range":"5d","interval":"5m","includePrePost":"true"},
-                      headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/14.8"},timeout=(2.5,4.5))
-        r.raise_for_status(); result=(r.json().get("chart",{}).get("result") or [None])[0]
-        if not result: return None
-        ts=result.get("timestamp") or []; close=((result.get("indicators",{}).get("quote") or [{}])[0].get("close") or [])
-        pts=[(int(t),safe_float(c,None)) for t,c in zip(ts,close) if c is not None and safe_float(c,None) is not None]
-        if len(pts)<2: return None
-        now_t,now_v=pts[-1]; target=now_t-lookback_seconds
-        old=min(pts,key=lambda x:abs(x[0]-target))[1]
-        return {"value":now_v,"change":pct(now_v,old),"ts":now_t}
-    except Exception:
-        return None
-
-def _liquidation_snapshot():
-    """Best-effort BTC liquidation pulse from a no-key public feed; optional evidence only."""
-    try:
-        r=SESSION.get("https://marginpad.io/api/v1/liquidations/recent",params={"symbol":"BTC","minutes":"60"},
-                      headers={"User-Agent":"JainaCoinMonitor/14.8"},timeout=(2.5,4.5))
-        r.raise_for_status(); j=r.json()
-        # tolerate several plausible response shapes
-        rows=j.get("data") or j.get("buckets") or j.get("items") or j.get("liquidations") or []
-        if isinstance(rows,dict): rows=rows.get("buckets") or rows.get("items") or []
-        longs=shorts=0.0
-        for x in rows if isinstance(rows,list) else []:
-            longs += safe_float(x.get("long") or x.get("longs") or x.get("long_liquidated") or x.get("long_notional"))
-            shorts += safe_float(x.get("short") or x.get("shorts") or x.get("short_liquidated") or x.get("short_notional"))
-        if longs<=0 and shorts<=0: return None
-        return {"long":longs,"short":shorts}
-    except Exception:
-        return None
-
-def market_data_cause_radar(direction):
-    """v14.9: news-independent corroboration from yields, dollar, US equities and liquidations.
-    It reports correlation/evidence, never asserts causality by itself.
-    """
-    syms={"미10년물":"%5ETNX","달러지수":"DX-Y.NYB","나스닥":"%5EIXIC","S&P500":"%5EGSPC"}
-    data={}
-    def one(k,v): return k,_yahoo_change(v,86400)
-    try:
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            for f in as_completed([ex.submit(one,k,v) for k,v in syms.items()]):
-                try:
-                    k,val=f.result(); data[k]=val
-                except Exception: pass
-    except Exception: pass
-    liq=_liquidation_snapshot()
-    score=0; signals=[]
-    if direction=="DOWN":
-        if data.get("미10년물") and data["미10년물"]["change"]>=0.35: score+=2; signals.append("미 국채금리 상승")
-        if data.get("달러지수") and data["달러지수"]["change"]>=0.25: score+=2; signals.append("달러 강세")
-        if data.get("나스닥") and data["나스닥"]["change"]<=-0.7: score+=2; signals.append("나스닥 약세")
-        if data.get("S&P500") and data["S&P500"]["change"]<=-0.5: score+=1; signals.append("S&P500 약세")
-        if liq and liq["long"]>max(liq["short"]*1.5,1000000): score+=2; signals.append("BTC 롱청산 우세")
-    else:
-        if data.get("미10년물") and data["미10년물"]["change"]<=-0.35: score+=2; signals.append("미 국채금리 하락")
-        if data.get("달러지수") and data["달러지수"]["change"]<=-0.25: score+=2; signals.append("달러 약세")
-        if data.get("나스닥") and data["나스닥"]["change"]>=0.7: score+=2; signals.append("나스닥 강세")
-        if data.get("S&P500") and data["S&P500"]["change"]>=0.5: score+=1; signals.append("S&P500 강세")
-        if liq and liq["short"]>max(liq["long"]*1.5,1000000): score+=2; signals.append("BTC 숏청산 우세")
-    return {"score":score,"signals":signals,"data":data,"liq":liq,"available":sum(v is not None for v in data.values())+(1 if liq else 0)}
-
-def _market_data_text(md):
-    if not md or not md.get("available"): return "📊 시장데이터 교차검증: 현재 외부 데이터 연결 실패 — 뉴스 판단에는 영향 없음"
-    bits=[]
-    for k in ("미10년물","달러지수","나스닥","S&P500"):
-        x=md.get("data",{}).get(k)
-        if x: bits.append(f"{k} {x['change']:+.2f}%")
-    liq=md.get("liq")
-    if liq: bits.append(f"BTC 1h 청산 롱 ${liq['long']/1e6:.1f}M / 숏 ${liq['short']/1e6:.1f}M")
-    sig=", ".join(md.get("signals") or []) or "뚜렷한 동조 신호 없음"
-    return "📊 시장데이터 교차검증\n• "+" · ".join(bits)+f"\n• 동조 신호: {sig} (점수 {md.get('score',0)}/9)"
 
 def market_cause_analysis_text(force_direction=None):
     """v13.8: 실시간 검색 실패 시에도 영구 거시 증거풀을 병합해 직접 원인을 최대한 복원한다."""
@@ -1792,7 +1658,6 @@ def market_cause_analysis_text(force_direction=None):
         vals=[move.get(s,{}).get("ret5") for s in ("WLD","KAIA") if move.get(s,{}).get("ret5") is not None]
         direction="UP" if (sum(vals)/len(vals) if vals else 0)>=0 else "DOWN"
 
-    md_radar=market_data_cause_radar(direction)
     expected=1 if direction=="UP" else -1
     ranked=[]; rejected_opposite=0; rejected_stale_price=0
     # v13.8: 뉴스 수집 예외가 /cause 전체를 죽이지 않도록 완전 격리.
@@ -1808,7 +1673,7 @@ def market_cause_analysis_text(force_direction=None):
             macro_items = []
         if not macro_items:
             recovered=[]
-            for _k in ("feed::CoinDesk","feed::CNBC","feed::CNBC Markets","feed::Cointelegraph","feed::Decrypt","feed::Federal Reserve","feed::BLS","feed::SEC"):
+            for _k in ("feed::CoinDesk","feed::CNBC","feed::CNBC Markets"):
                 try: recovered.extend(_news_cache_get(_k,12,True))
                 except Exception: pass
             macro_items=_dedupe_news(recovered)
@@ -1857,7 +1722,7 @@ def market_cause_analysis_text(force_direction=None):
                 selected.append(row); seen_cats.add(cat)
             if len(selected)>=3: break
 
-    # v14.7: 지속하락/강제 DOWN 분석인데 1순위 근거가 비면 원인 전용 긴급검색을 한 번 더 수행한다.
+    # v14.6: 지속하락/강제 DOWN 분석인데 1순위 근거가 비면 원인 전용 긴급검색을 한 번 더 수행한다.
     # 일반 뉴스검색과 분리해 연준·금리/국채·달러/청산·옵션/ETF/규제·지정학을 직접 겨냥한다.
     emergency_used=False
     background_pool=[]
@@ -1921,7 +1786,7 @@ def market_cause_analysis_text(force_direction=None):
             if total>=9 and (ds>0 or direct>=2):
                 eranked.append((total,ds,sourceq,freshness,cat,age,it,direct,5 if forecast else 0,polarity,catsupport))
         eranked.sort(key=lambda x:(x[0],x[2],x[7],-x[5]),reverse=True)
-        # v14.7: 0~12h 직접원인 > 12~24h 최근원인 > 24~72h 배경원인.
+        # v14.6: 0~12h 직접원인 > 12~24h 최근원인 > 24~72h 배경원인.
         # 오래된 배경뉴스가 오늘 하락의 1순위 직접원인으로 승격되지 않게 한다.
         primary_pool=[r for r in eranked if _cause_time_bucket(r[5]) in ("direct","recent")]
         background_pool=[r for r in eranked if _cause_time_bucket(r[5])=="background"]
@@ -1947,19 +1812,15 @@ def market_cause_analysis_text(force_direction=None):
     if selected and selected[0][2]>=4: confidence+=10
     if selected and selected[0][7]>=2: confidence+=7
     if len(seen_cats)>=2: confidence+=5
-    # v14.9: cross-asset data can corroborate news, but cannot create a news cause by itself.
-    if selected and md_radar.get("score",0)>=3: confidence+=5
-    if selected and md_radar.get("score",0)>=5: confidence+=5
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v14.9】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v14.6】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if news_collect_error:
         parts += ["⚠️ 실시간 뉴스 수집 오류를 격리하고 영구 캐시로 계속 분석", ""]
     if NEWS_HEALTH.get("last_errors",0):
         parts.append(f"⚠️ 뉴스 연결 일부 지연 {NEWS_HEALTH['last_errors']}건 — 확보 기사 {NEWS_HEALTH.get('last_ok',0)}건으로 계속 분석")
         parts.append("")
-    parts += [_market_data_text(md_radar), ""]
     if emergency_used and selected:
         parts += ["🛟 일반 검색 근거 부족 → 지속하락 원인 전용 긴급검색·영구캐시 복구 성공", ""]
     elif emergency_used and not selected and background_pool:
@@ -2037,7 +1898,7 @@ def market_cause_worker(direction,cid):
 def causetest_text():
     """실제 시세/장부를 변경하지 않는 원인분석 기능 테스트."""
     return (
-        "🧪 【v14.9 급변 원인분석 테스트】\n\n"
+        "🧪 【v13.8 급변 원인분석 테스트】\n\n"
         "✅ BTC 선행 급락 감지 모듈\n"
         "✅ WLD·KAIA 개별 급변 감지 모듈\n"
         "✅ 연준·금리/물가·고용/달러·국채/ETF/청산/규제/해킹/지정학 분류\n"
@@ -2064,7 +1925,7 @@ def causetest_text():
         "✅ 뉴스 오류여도 /cause 전체 fallback 방지\n"
         "✅ 0~12시간 직접원인 최우선 + 12~24시간 최근원인 차순위\n"
         "✅ 24~72시간 오래된 뉴스는 배경원인으로 분리\n"
-        "✅ 청산·ETF·나스닥·금리 현재 하락 전용검색 강화\n✅ v14.7 직접수집망 8개: CoinDesk/CNBC/Cointelegraph/Decrypt/Fed/BLS/SEC\n✅ 직접 RSS 최대4개 병렬 + 개별실패 캐시복구\n✅ 검색엔진 장애 시 공식 거시기관 RSS·영구증거풀 우선\n✅ v14.9 시장데이터 교차검증: 미10년물·DXY·나스닥·S&P500·BTC 청산\n✅ v14.9 누적 가격히스토리 영구저장·재배포 즉시복원(30분/1시간/4시간)\n✅ 뉴스 원인과 시장데이터 동조 시 신뢰도 가산, 데이터 단독 인과단정 금지\n\n"
+        "✅ 청산·ETF·나스닥·금리 현재 하락 전용검색 강화\n\n"
         "※ 가상 테스트이며 가격·평단·수량·현금·장부는 변경하지 않습니다."
     )
 
@@ -2181,7 +2042,7 @@ def rapid_cause_text(symbol, d):
 
 
 def sustained_decline_status(symbol,d):
-    """v14.7: 누적봉이 0이어도 기존 일간/고점/추세 데이터로 지속하락 상태를 직접 판정."""
+    """v14.6: 누적봉이 0이어도 기존 일간/고점/추세 데이터로 지속하락 상태를 직접 판정."""
     daily=d.get("daily",{}) or {}
     prev=safe_float(daily.get("prev24_change_pct")) if daily.get("ready") else 0.0
     today=safe_float(daily.get("today_change_pct")) if daily.get("ready") else 0.0
@@ -2230,7 +2091,7 @@ def rapid_triggered(symbol,d):
 def rapid_cause_worker(symbol,d,cid):
     try:
         with RAPID_LOCK:
-            # v14.7: 지속하락 트리거는 BTC 단기 반등과 무관하게 하락 원인으로 고정
+            # v14.6: 지속하락 트리거는 BTC 단기 반등과 무관하게 하락 원인으로 고정
             if d.get("sustained_decline"):
                 send_long(rapid_cause_text(symbol,d),cid)
                 send_long(market_cause_analysis_text("DOWN"),cid)
@@ -2260,7 +2121,7 @@ def rapid_cause_report_text():
     m=market_move_snapshot().get("BTC",{})
     parts.append(f"\nBTC 참고: 1분 {(m.get('ret1') or 0):+.2f}% · 5분 {(m.get('ret5') or 0):+.2f}% · 30분 {(m.get('ret30') or 0):+.2f}% · 1시간 {(m.get('ret60') or 0):+.2f}% · 4시간 {(m.get('ret4h') or 0):+.2f}%")
     parts.append("※ 자동알림: 순간급변 + 30분·1시간·4시간 누적 급등락 동시 감시")
-    # v14.7: WLD/KAIA 중 하나라도 지속하락이면 수동 /cause도 하락 방향으로 분석
+    # v14.6: WLD/KAIA 중 하나라도 지속하락이면 수동 /cause도 하락 방향으로 분석
     sustained_any = any(
         sustained_decline_status(sym, snap.get(sym))[0]
         for sym in ("WLD", "KAIA") if snap.get(sym)
@@ -2488,7 +2349,7 @@ def run_enginetest(cid):
     header="✅ v11 판단엔진 전체 통과" if all_ok else "❌ v11 판단엔진 일부 실패"
     send(header+"\n\n"+"\n\n".join(lines),cid)
 
-# ---------- v14.7 PRE-EVENT MARKET RADAR + SUSTAINED DECLINE ALERT ----------
+# ---------- v14.9 WLD + KAIA LEADING CATALYST RADAR + PRE-EVENT MARKET RADAR ----------
 EVENT_RADAR_INTERVAL = 15 * 60
 EVENT_RADAR_LAST_DAILY = ""
 EVENT_RADAR_SENT = set()
@@ -2533,8 +2394,8 @@ def dynamic_policy_radar(limit=4):
     queries=[
         'US crypto bill vote hearing deadline SEC CFTC stablecoin market structure when:7d',
         'Bitcoin crypto ETF SEC decision deadline approval when:7d',
-        'Worldcoin WLD regulation launch unlock partnership upcoming when:7d',
-        'KAIA Kaia blockchain launch partnership regulation upcoming when:7d',
+        'Worldcoin WLD World Network World ID OpenAI ChatGPT Sam Altman AI agent proof of human partnership launch regulation unlock upcoming when:7d',
+        'KAIA Kaia blockchain KRW won stablecoin Korea bank Kakao LINE RWA payment partnership regulation governance tokenomics upcoming when:7d',
     ]
     future_words=('vote','voting','hearing','deadline','scheduled','upcoming','expected','set to','will ','approval','decision','표결','청문','마감','예정','심사','승인')
     rows=[]; seen=set()
@@ -2549,6 +2410,103 @@ def dynamic_policy_radar(limit=4):
         except Exception:
             pass
     return rows[:limit]
+
+
+# v14.9: project-specific leading catalyst radar.
+# Goal: detect plausible WLD/KAIA catalysts before price reacts, while clearly separating direct vs indirect links.
+LEADING_CATALYST_QUERIES = {
+    "WLD": [
+        'Worldcoin OR "World Network" OR "World ID" partnership launch expansion regulation tokenomics unlock when:2d',
+        'OpenAI OR ChatGPT OR "Sam Altman" AI agents "proof of human" identity when:2d',
+    ],
+    "KAIA": [
+        'KAIA OR "Kaia blockchain" partnership launch mainnet governance tokenomics RWA when:2d',
+        'Korea KRW won stablecoin bank payment Kakao LINE blockchain regulation bill when:2d',
+    ],
+}
+
+LEADING_DIRECT = {
+    "WLD": ('worldcoin','world network','world id','world chain','wld'),
+    "KAIA": ('kaia','kaia blockchain','kaia foundation','kaia dlt'),
+}
+LEADING_INDIRECT = {
+    "WLD": ('openai','chatgpt','sam altman','ai agent','proof of human','proof-of-human','digital identity'),
+    "KAIA": ('stablecoin','스테이블코인','krw','원화','bank','은행','kakao','카카오','line','라인','rwa','payment','결제'),
+}
+LEADING_POSITIVE = ('partnership','partner','launch','expand','expansion','adoption','integrat','approval','approve','pass','passed','growth','record','revenue','investment','invest','stablecoin','rwa','제휴','출시','확대','도입','승인','통과','성장','매출','투자')
+LEADING_FUTURE = ('will ','plan','planned','upcoming','scheduled','expected','set to','proposal','vote','hearing','deadline','예정','계획','추진','표결','청문','심사')
+LEADING_NEGATIVE = ('hack','exploit','ban','lawsuit','investigation','delist','delay','reject','rejected','해킹','금지','소송','조사','상폐','연기','거부')
+LEADING_LAST = {}
+LEADING_COOLDOWN = 6 * 3600
+
+def _leading_grade(symbol,title):
+    low=(title or '').lower()
+    direct=any(k in low for k in LEADING_DIRECT[symbol])
+    indirect=any(k in low for k in LEADING_INDIRECT[symbol])
+    positive=any(k in low for k in LEADING_POSITIVE)
+    future=any(k in low for k in LEADING_FUTURE)
+    negative=any(k in low for k in LEADING_NEGATIVE)
+    if negative:
+        return None
+    if direct and positive:
+        return ('S','직접 호재 후보')
+    if direct and future:
+        return ('A','직접 예정 이벤트')
+    if indirect and (positive or future):
+        return ('A','간접 선행호재 후보')
+    return None
+
+def leading_catalyst_rows(symbol,limit=5):
+    rows=[]; seen=set()
+    for q in LEADING_CATALYST_QUERIES[symbol]:
+        try:
+            for it in google_news_rss(q,5):
+                title=(it.get('title') or '').strip()
+                if not title: continue
+                grade=_leading_grade(symbol,title)
+                if not grade: continue
+                key=title.lower()[:180]
+                if key in seen: continue
+                seen.add(key)
+                rows.append((grade[0],grade[1],it))
+        except Exception as e:
+            print('[LeadingRadar]',symbol,type(e).__name__,flush=True)
+    rows.sort(key=lambda x: 0 if x[0]=='S' else 1)
+    return rows[:limit]
+
+def leading_catalyst_text():
+    parts=['🚨 【WLD · KAIA 선행호재 레이다】']
+    found=False
+    for symbol in ('WLD','KAIA'):
+        rows=leading_catalyst_rows(symbol,4)
+        parts.append(f'\n{symbol}')
+        if not rows:
+            parts.append('• 현재 S/A급 신규 후보 없음')
+            continue
+        found=True
+        for grade,kind,it in rows:
+            caution='직접 프로젝트 뉴스' if kind.startswith('직접') else '간접 연계 — 가격호재 단정 금지'
+            parts.append(f'• [{grade}급] {kind} · {caution}\n{it.get("title","")}\n{it.get("link","")}')
+    parts.append('\n판정: S=프로젝트 직접 중요호재 후보 · A=예정/간접 선행호재 후보')
+    parts.append('Coinone 가격·거래량 반응이 동반되면 기존 중요알람/원인 레이다에서 재평가합니다.')
+    parts.append('※ 자동주문 없음')
+    return '\n'.join(parts)
+
+def leading_catalyst_loop():
+    while True:
+        try:
+            if CHAT_ID:
+                now=time.time()
+                for symbol in ('WLD','KAIA'):
+                    for grade,kind,it in leading_catalyst_rows(symbol,4):
+                        title=(it.get('title') or '').strip(); key=f'{symbol}:{title.lower()[:180]}'
+                        if now-LEADING_LAST.get(key,0) < LEADING_COOLDOWN: continue
+                        LEADING_LAST[key]=now
+                        caution='직접 프로젝트 뉴스' if kind.startswith('직접') else '간접 연계 뉴스 — WLD/KAIA 직접 호재로 단정하지 않음'
+                        send(f'🚨 {symbol} 예상호재 레이다 [{grade}급]\n{kind}\n{title}\n→ {caution}\n→ Coinone 가격·거래량 후속반응 집중감시\n{it.get("link","")}',CHAT_ID)
+        except Exception as e:
+            print('[LeadingRadar] loop error',e,flush=True)
+        time.sleep(15*60)
 
 def event_radar_text():
     parts=['📡 【자이나 시장 이벤트 사전 레이더】']
@@ -2613,7 +2571,9 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v14.9 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v14.6 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/lead WLD·KAIA 선행호재 레이다\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+            elif text.startswith("/lead"):
+                send_long(leading_catalyst_text(),cid)
             elif text.startswith("/radar"):
                 send_long(event_radar_text(),cid)
             elif text.startswith("/sellqty"):
@@ -2817,6 +2777,7 @@ def health(): return "OK",200
 threading.Thread(target=monitor_loop,daemon=True).start()
 threading.Thread(target=telegram_loop,daemon=True).start()
 threading.Thread(target=event_radar_loop,daemon=True).start()
+threading.Thread(target=leading_catalyst_loop,daemon=True).start()
 threading.Thread(target=persistence_loop,daemon=True).start()
 threading.Thread(target=auto_news_loop,daemon=True).start()
 threading.Thread(target=auto_summary_loop,daemon=True).start()
