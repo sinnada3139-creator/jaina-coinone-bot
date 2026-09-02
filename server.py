@@ -1,4 +1,7 @@
 import os, time, threading, requests, json, html
+
+BOT_VERSION = "15.3"
+CAUSE_ENGINE = "GEO-OIL-RISKOFF-v3"
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from collections import deque
@@ -1284,7 +1287,7 @@ def bing_news_rss(query, limit=6):
     key="bing::"+query
     try:
         url="https://www.bing.com/news/search?q="+quote_plus(query)+"&format=rss&mkt=en-US"
-        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/15.2"},timeout=(2.5,5.0))
+        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/15.3"},timeout=(2.5,5.0))
         r.raise_for_status()
         items=_parse_rss_items(r.content,limit,"Bing News")
         _news_cache_put(key,items)
@@ -1296,28 +1299,33 @@ def bing_news_rss(query, limit=6):
 
 
 def direct_crypto_feeds(limit=10):
-    """v13.0 보조 경로: 검색엔진을 거치지 않는 직접 금융/크립토 RSS."""
+    """v15.3: 직접 금융/크립토 RSS를 병렬 수집. 한 피드 timeout이 다른 피드를 지연시키지 않는다."""
     feeds=[
         ("CoinDesk","https://www.coindesk.com/arc/outboundfeeds/rss/"),
         ("CNBC","https://www.cnbc.com/id/10000664/device/rss/rss.html"),
-        # v13.8: 검색엔진 장애와 독립된 추가 금융 피드. 실패해도 다른 피드는 계속 동작.
         ("CNBC Markets","https://www.cnbc.com/id/100003114/device/rss/rss.html"),
         ("Cointelegraph","https://cointelegraph.com/rss"),
         ("Decrypt","https://decrypt.co/feed"),
     ]
-    out=[]
-    for source,url in feeds:
+    def fetch_one(source,url):
         key="feed::"+source
         try:
-            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/15.2"},timeout=(2.5,5.0))
+            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/15.3"},timeout=(1.8,3.2))
             r.raise_for_status()
             items=_parse_rss_items(r.content,limit,source)
             _news_cache_put(key,items)
-            _macro_pool_put(items)
-            out.extend(items)
+            return items
         except Exception:
-            out.extend(_news_cache_get(key,limit,True))
-    return _dedupe_news(out)
+            return _news_cache_get(key,limit,True)
+    out=[]
+    with ThreadPoolExecutor(max_workers=len(feeds)) as ex:
+        futs=[ex.submit(fetch_one,source,url) for source,url in feeds]
+        for f in as_completed(futs):
+            try: out.extend(f.result() or [])
+            except Exception: pass
+    out=_dedupe_news(out)
+    if out: _macro_pool_put(out)
+    return out
 
 
 def multisource_news(query, limit=7, priority=False):
@@ -1345,7 +1353,7 @@ def google_news_rss(query, limit=4, priority=False):
         raise requests.exceptions.ReadTimeout("news circuit open")
     url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=ko&gl=KR&ceid=KR:ko"
     try:
-        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/15.2"}, timeout=(2.5,4.5))
+        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/15.3"}, timeout=(2.5,4.5))
         r.raise_for_status()
         root = ET.fromstring(r.content)
         items = []
@@ -1501,6 +1509,9 @@ def _macro_news(direction="DOWN"):
             'US Iran strikes Hormuz oil Bitcoin crypto risk selloff when:1d',
             'Iran attack oil Brent WTI Treasury yields Bitcoin falls when:1d',
             '미국 이란 공격 공습 호르무즈 유가 비트코인 하락 when:1d',
+            '미국 이란 미사일 공격 유가 상승 코인 급락',
+            'US Iran missile attack oil prices rise Bitcoin crypto',
+            'Iran retaliation Hormuz crude oil risk assets Bitcoin',
         ]
         searched, err1=collect_parallel(urgent, limit=10)
         first=_dedupe_news(first + searched)
@@ -1626,7 +1637,7 @@ def _cause_chain(cat, direction):
 
 
 def _is_cross_asset_catalyst(title, cat):
-    """v15.2: 원유 상승/전쟁 격화처럼 '제목 방향'은 상승이어도 BTC에는 악재인 교차자산 촉매를 식별."""
+    """v15.3: 원유 상승/전쟁 격화처럼 '제목 방향'은 상승이어도 BTC에는 악재인 교차자산 촉매를 식별."""
     low=(title or "").lower()
     if cat == "에너지·유가":
         return any(w in low for w in ("oil","crude","brent","wti","유가","원유","호르무즈","hormuz"))
@@ -1638,7 +1649,7 @@ def _is_cross_asset_catalyst(title, cat):
 
 
 def _shock_signature(title):
-    """v15.2: 단일 카테고리보다 시장충격 연쇄를 먼저 감지한다."""
+    """v15.3: 단일 카테고리보다 시장충격 연쇄를 먼저 감지한다."""
     low=(title or "").lower()
     geo=sum(1 for w in ("iran","israel","u.s."," us ","strike","airstrike","missile","attack","retaliat","hormuz","이란","이스라엘","미국","공습","미사일","공격","보복","호르무즈") if w in low)
     oil=sum(1 for w in ("oil","crude","brent","wti","energy","유가","원유","브렌트","에너지") if w in low)
@@ -1869,7 +1880,7 @@ def market_cause_analysis_text(force_direction=None):
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v15.2】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v15.3】",f"🧠 원인엔진 {CAUSE_ENGINE}",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if news_collect_error:
         parts += ["⚠️ 실시간 뉴스 수집 오류를 격리하고 영구 캐시로 계속 분석", ""]
     if NEWS_HEALTH.get("last_errors",0):
