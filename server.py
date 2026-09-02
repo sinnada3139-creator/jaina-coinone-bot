@@ -477,10 +477,6 @@ def move_mark(v):
 
 TREND_CACHE = {}
 TREND_CACHE_TTL = 60
-VOLUME_CACHE = {}
-VOLUME_CACHE_TTL = 45
-VOLUME_ALERT_LAST = {"WLD": {"level": 0, "ts": 0.0}, "KAIA": {"level": 0, "ts": 0.0}}
-VOLUME_ALERT_COOLDOWN = 17 * 60
 
 def ema(values, period):
     if not values: return 0.0
@@ -533,47 +529,6 @@ def timeframe_metrics(rows):
     return {"ready":True,"price":closes[-1],"ema20":e20,"ema60":e60,"ema_bull":e20>e60,
             "slope":slope,"rsi":rv,"macd":m,"macd_signal":ms,"macd_hist":mh,
             "macd_bull":m>ms,"hh":hh,"hl":hl,"vol_ratio":vr}
-
-def volume_analysis(symbol):
-    """v15.0 strategic volume radar: 5m acceleration + 15m acceleration + rolling 24h vs prior 24h."""
-    now=time.time(); cached=VOLUME_CACHE.get(symbol)
-    if cached and now-cached.get("ts",0)<VOLUME_CACHE_TTL: return cached["data"]
-    try:
-        one=fetch_chart(symbol,"1m",120)
-        hour=fetch_chart(symbol,"1h",60)
-        v1=[safe_float(x.get("quote_volume")) for x in one if safe_float(x.get("quote_volume"))>=0]
-        vh=[safe_float(x.get("quote_volume")) for x in hour if safe_float(x.get("quote_volume"))>=0]
-        if len(v1)<45 or len(vh)<48: raise RuntimeError("거래량 캔들 데이터 부족")
-        v5=sum(v1[-5:]); base5=(sum(v1[-35:-5])/30.0)*5.0
-        v15=sum(v1[-15:]); base15=(sum(v1[-45:-15])/30.0)*15.0
-        r5=v5/base5 if base5>0 else 1.0
-        r15=v15/base15 if base15>0 else 1.0
-        cur24=sum(vh[-24:]); prev24=sum(vh[-48:-24]); r24=cur24/prev24 if prev24>0 else 1.0
-        pct24=(r24-1.0)*100.0
-        level=3 if (r5>=3.0 or r15>=3.0 or r24>=3.0) else (2 if (r5>=2.0 or r15>=2.0 or r24>=2.0) else (1 if (r5>=1.5 or r15>=1.5 or r24>=1.5) else 0))
-        data={"ready":True,"r5":r5,"r15":r15,"r24":r24,"pct24":pct24,"level":level}
-    except Exception as e:
-        data={"ready":False,"r5":1.0,"r15":1.0,"r24":1.0,"pct24":0.0,"level":0,"error":str(e)}
-    VOLUME_CACHE[symbol]={"ts":now,"data":data}; return data
-
-def volume_alert_text(symbol,d):
-    v=d.get("volume",{}) or {}; move=d.get("ret5m",0.0)
-    if move>=1.0: flow="🟢 가격상승 + 거래량급증 → 매수세/돌파 신뢰 강화"
-    elif move<=-1.0: flow="🔴 가격하락 + 거래량급증 → 투매/대량매도 가능성"
-    else: flow="⚡ 가격 선행 거래량 급증 → 수급 변화 선행 가능성"
-    return (f"🚨 【{symbol} 전략적 거래량 중요알림】\n"
-            f"현재가 {d.get('price',0):,.4f}원 · 5분 {move:+.2f}%\n"
-            f"5분 거래량 {v.get('r5',1):.2f}배 · 15분 {v.get('r15',1):.2f}배\n"
-            f"최근24시간/직전24시간 {v.get('r24',1):.2f}배 ({v.get('pct24',0):+.0f}%)\n"
-            f"{flow}\n🔎 중요 뉴스·원인 레이다 연동")
-
-def volume_alert_triggered(symbol,d):
-    v=d.get("volume",{}) or {}; level=int(v.get("level",0) or 0)
-    if not v.get("ready") or level<2: return False
-    now=time.time(); last=VOLUME_ALERT_LAST[symbol]
-    # 2x=important, 3x=high. Escalation bypasses cooldown; otherwise suppress duplicates for 17m.
-    if level<=last.get("level",0) and now-last.get("ts",0)<VOLUME_ALERT_COOLDOWN: return False
-    last["level"]=level; last["ts"]=now; return True
 
 def trend_analysis(symbol):
     now=time.time(); cached=TREND_CACHE.get(symbol)
@@ -716,7 +671,6 @@ def strategy(symbol, tick):
         phase="관찰"
         trend=trend_analysis(symbol)
         daily=daily_reference(symbol,p)
-        volume=volume_analysis(symbol)
 
         # 0) 급락 방어가 최우선
         if price_dd<=-25:
@@ -869,7 +823,6 @@ def strategy(symbol, tick):
             "ret1h":ret60,
             "ret4h":ret4h,
             "vol_ratio":vol_ratio,
-            "volume":volume,
             "signal":signal,
             "score":score,
             "reason":reason,
@@ -932,8 +885,7 @@ def alert_text(symbol,d):
         f"평단대비 {d['gain_pct']:+.2f}%\n"
         f"고점대비 {d['drawdown_pct']:+.2f}%\n"
         f"1분 {d['ret1m']:+.2f}% / 5분 {d['ret5m']:+.2f}%\n"
-        f"거래량 5분 {d.get('volume',{}).get('r5',d['vol_ratio']):.2f}배 · 15분 {d.get('volume',{}).get('r15',1):.2f}배\n"
-        f"24시간 거래량 직전24h 대비 {d.get('volume',{}).get('pct24',0):+.0f}% ({d.get('volume',{}).get('r24',1):.2f}배)\n"
+        f"거래량비 {d['vol_ratio']:.2f}배\n"
         f"📈 추세신뢰도 {d.get('trend',{}).get('score',0)}/100 · {d.get('trend',{}).get('label','⚪ 확인중')}\n"
         f"단기(15분봉) EMA20/60 {'🟢' if d.get('trend',{}).get('short',{}).get('ema_bull') else '🔴'} · RSI {d.get('trend',{}).get('short',{}).get('rsi',50):.1f} · MACD {'🟢' if d.get('trend',{}).get('short',{}).get('macd_bull') else '🔴'}\n"
         f"중기(4시간봉) EMA20/60 {'🟢' if d.get('trend',{}).get('mid',{}).get('ema_bull') else '🔴'} · RSI {d.get('trend',{}).get('mid',{}).get('rsi',50):.1f} · MACD {'🟢' if d.get('trend',{}).get('mid',{}).get('macd_bull') else '🔴'}\n"
@@ -974,11 +926,6 @@ def monitor_loop():
                 if s not in COINS:
                     continue
                 d=strategy(s,tick)
-                # v15.0: volume can lead price, so alert before price thresholds are reached.
-                if CHAT_ID and volume_alert_triggered(s,d):
-                    send(volume_alert_text(s,d),CHAT_ID)
-                    if d.get("ret5m",0)>=1.0 or d.get("ret5m",0)<=-1.0:
-                        threading.Thread(target=rapid_cause_worker,args=(s,dict(d),CHAT_ID),daemon=True).start()
                 # v14.6: 순간/누적 급변뿐 아니라 지속 하락+15분/4시간 추세 붕괴도 중요 원인알람
                 sustained = CHAT_ID and sustained_decline_triggered(s,d)
                 rapid = CHAT_ID and rapid_triggered(s,d)
@@ -1337,7 +1284,7 @@ def bing_news_rss(query, limit=6):
     key="bing::"+query
     try:
         url="https://www.bing.com/news/search?q="+quote_plus(query)+"&format=rss&mkt=en-US"
-        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.8"},timeout=(2.5,5.0))
+        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/15.2"},timeout=(2.5,5.0))
         r.raise_for_status()
         items=_parse_rss_items(r.content,limit,"Bing News")
         _news_cache_put(key,items)
@@ -1355,12 +1302,14 @@ def direct_crypto_feeds(limit=10):
         ("CNBC","https://www.cnbc.com/id/10000664/device/rss/rss.html"),
         # v13.8: 검색엔진 장애와 독립된 추가 금융 피드. 실패해도 다른 피드는 계속 동작.
         ("CNBC Markets","https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+        ("Cointelegraph","https://cointelegraph.com/rss"),
+        ("Decrypt","https://decrypt.co/feed"),
     ]
     out=[]
     for source,url in feeds:
         key="feed::"+source
         try:
-            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.8"},timeout=(2.5,5.0))
+            r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/15.2"},timeout=(2.5,5.0))
             r.raise_for_status()
             items=_parse_rss_items(r.content,limit,source)
             _news_cache_put(key,items)
@@ -1396,7 +1345,7 @@ def google_news_rss(query, limit=4, priority=False):
         raise requests.exceptions.ReadTimeout("news circuit open")
     url = "https://news.google.com/rss/search?q=" + quote_plus(query) + "&hl=ko&gl=KR&ceid=KR:ko"
     try:
-        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/13.8"}, timeout=(2.5,4.5))
+        r = SESSION.get(url, headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/15.2"}, timeout=(2.5,4.5))
         r.raise_for_status()
         root = ET.fromstring(r.content)
         items = []
@@ -1485,13 +1434,16 @@ def _macro_news(direction="DOWN"):
         'Bitcoin inflation PCE CPI jobs payroll crypto market when:1d',
         'Bitcoin ETF inflow outflow liquidation options expiry crypto when:1d',
         'Bitcoin regulation hack geopolitical tariff crypto when:1d',
+        'Iran US strikes missiles Hormuz oil Brent WTI markets crypto Bitcoin when:1d',
+        'Middle East war oil prices yields risk off Bitcoin crypto when:1d',
+        '미국 이란 공습 미사일 호르무즈 유가 비트코인 코인 하락 when:1d',
         '비트코인 연준 의장 금리 국채 달러 가상자산 when:1d',
         '비트코인 청산 ETF 유출 옵션 만기 규제 해킹 when:1d',
     ]
     if direction == "UP":
         stage1 += ['Bitcoin crypto rally rate cut dovish ETF inflow rebound when:1d']
     else:
-        stage1 += ['Bitcoin crypto selloff rate hike hawkish yields dollar liquidation when:1d']
+        stage1 += ['Bitcoin crypto selloff rate hike hawkish yields dollar liquidation when:1d', 'US Iran attack oil surge risk off Bitcoin falls when:1d']
 
     stage2 = [
         'Bitcoin falls Fed chair rate hike Treasury yields dollar when:2d',
@@ -1501,6 +1453,8 @@ def _macro_news(direction="DOWN"):
         'Bitcoin Nasdaq risk assets selloff yields dollar when:2d',
         '비트코인 하락 연준 매파 금리인상 국채금리 달러강세 when:2d',
         '비트코인 급락 롱 청산 옵션 만기 ETF 유출 when:2d',
+        'US Iran strikes Hormuz oil surge stocks bonds Bitcoin crypto when:2d',
+        '미 이란 공격 유가 급등 위험회피 비트코인 하락 when:2d',
     ] if direction == "DOWN" else [
         'Bitcoin rises Fed dovish rate cut Treasury yields dollar when:2d',
         'Bitcoin rally ETF inflows short liquidation when:2d',
@@ -1540,8 +1494,18 @@ def _macro_news(direction="DOWN"):
     # 직접 근거가 충분하지 않을 때만 핵심 검색어 2개를 우선 조회한다.
     # 전체 검색어 폭탄 대신 짧은 1차 보강 후 필요할 때만 심층검색한다.
     fresh0=[x for x in first if _news_age_hours(x)<=30 or _news_age_hours(x)>=999]
-    if len(fresh0) < 12:
-        urgent = stage1[-2:] if direction == "DOWN" else stage1[-1:] + stage1[:1]
+    # v15.2: 하락 때는 기존 캐시 기사 수가 충분해도 지정학/유가 충격검색을 반드시 실행한다.
+    # 과거에는 unrelated 기사 12개가 있으면 긴급검색 자체가 생략되는 사각지대가 있었다.
+    if direction == "DOWN":
+        urgent = [
+            'US Iran strikes Hormuz oil Bitcoin crypto risk selloff when:1d',
+            'Iran attack oil Brent WTI Treasury yields Bitcoin falls when:1d',
+            '미국 이란 공격 공습 호르무즈 유가 비트코인 하락 when:1d',
+        ]
+        searched, err1=collect_parallel(urgent, limit=10)
+        first=_dedupe_news(first + searched)
+    elif len(fresh0) < 12:
+        urgent = stage1[-1:] + stage1[:1]
         searched, err1=collect_parallel(urgent, limit=8)
         first=_dedupe_news(first + searched)
 
@@ -1577,7 +1541,9 @@ def _macro_category(title):
         ("레버리지·옵션", ("liquidation","liquidated","leverage","options expiry","option expiry","청산","레버리지","옵션 만기")),
         ("규제·법률", ("regulation","regulator","sec ","ban","lawsuit","규제","당국","소송","금지")),
         ("해킹·보안", ("hack","exploit","breach","해킹","익스플로잇","보안")),
-        ("지정학·관세", ("war ","conflict","tariff","geopolitical","전쟁","분쟁","관세","지정학")),
+        ("에너지·유가", ("oil","crude","brent","wti","energy price","oil price","oil prices","hormuz","유가","원유","브렌트","wti","에너지 가격","호르무즈")),
+        ("지정학·전쟁", ("war ","conflict","strike","strikes","airstrike","missile","attack","iran","israel","hormuz","geopolitical","전쟁","분쟁","공습","미사일","공격","이란","이스라엘","호르무즈")),
+        ("관세", ("tariff","관세")),
     ]
     for name, words in groups:
         if any(w in low for w in words): return name
@@ -1595,7 +1561,9 @@ def _category_support_score(title, cat):
         "레버리지·옵션": ("liquidation","liquidated","leverage","options expiry","option expiry","청산","레버리지","옵션 만기"),
         "규제·법률": ("regulation","regulator","sec ","clarity act","lawsuit","ban","규제","당국","소송","금지"),
         "해킹·보안": ("hack","exploit","breach","해킹","익스플로잇","보안"),
-        "지정학·관세": ("war ","conflict","tariff","geopolitical","전쟁","분쟁","관세","지정학"),
+        "에너지·유가": ("oil","crude","brent","wti","oil price","oil prices","energy price","hormuz","유가","원유","브렌트","에너지 가격","호르무즈"),
+        "지정학·전쟁": ("war ","conflict","strike","strikes","airstrike","missile","attack","iran","israel","hormuz","geopolitical","전쟁","분쟁","공습","미사일","공격","이란","이스라엘","호르무즈"),
+        "관세": ("tariff","관세"),
     }
     return sum(1 for w in anchors.get(cat,()) if w in low)
 
@@ -1625,7 +1593,7 @@ def _is_forecast_or_preview(title):
 def _direct_event_score(title, cat):
     """실제 발언/결정/발표/자금흐름처럼 인과성이 강한 제목에 가점."""
     low=(title or "").lower()
-    event=("says","said","signals","warns","announces","raises","cuts","holds rates","data shows","outflow","inflow","liquidated","speech","remarks","발언","밝혀","발표","결정","인상","인하","동결","유출","유입","청산")
+    event=("says","said","signals","warns","announces","raises","cuts","holds rates","data shows","outflow","inflow","liquidated","speech","remarks","strike","strikes","attacks","attacked","missile","retaliates","surges","jumps","발언","밝혀","발표","결정","인상","인하","동결","유출","유입","청산","공습","공격","미사일","보복","급등")
     score=sum(1 for w in event if w in low)
     if cat in ("연준·금리","미국 물가·고용") and any(w in low for w in ("fed","federal reserve","warsh","powell","연준","의장")):
         score+=2
@@ -1649,11 +1617,37 @@ def _cause_chain(cat, direction):
         "레버리지·옵션": "롱 청산·옵션 만기 변동성 → 강제매도/헤지 → 하락폭 확대" if down else "숏 청산·옵션 포지션 조정 → 강제매수 → 상승폭 확대",
         "규제·법률": "규제 불확실성 확대 → 위험회피 → 크립토 매도 압력" if down else "규제 불확실성 완화 → 위험선호 개선 → 크립토 매수",
         "해킹·보안": "보안 사고 우려 → 위험회피 → 시장 매도 압력",
-        "지정학·관세": "지정학/관세 불확실성 → 위험회피 → BTC·알트 압력" if down else "지정학 불확실성 완화 → 위험선호 회복",
+        "에너지·유가": "유가 급등/공급차질 우려 → 인플레이션·국채금리 압력 → 위험회피 → BTC·알트 하락" if down else "유가 안정/공급우려 완화 → 금리 부담 완화 → 위험선호 회복",
+        "지정학·전쟁": "전쟁·공습 격화 → 원유/안전자산 충격 → 인플레이션·금리 우려 → 위험회피 → BTC·알트 하락" if down else "지정학 긴장 완화 → 에너지·금리 부담 완화 → 위험선호 회복",
+        "관세": "관세 불확실성 → 물가·성장 우려 → 위험회피 → BTC·알트 압력" if down else "관세 불확실성 완화 → 위험선호 회복",
     }
     return chains.get(cat,"시장 수급 변화 → BTC 변동 → WLD·KAIA 동조 가능성")
 
 
+
+def _is_cross_asset_catalyst(title, cat):
+    """v15.2: 원유 상승/전쟁 격화처럼 '제목 방향'은 상승이어도 BTC에는 악재인 교차자산 촉매를 식별."""
+    low=(title or "").lower()
+    if cat == "에너지·유가":
+        return any(w in low for w in ("oil","crude","brent","wti","유가","원유","호르무즈","hormuz"))
+    if cat == "지정학·전쟁":
+        return any(w in low for w in ("strike","attack","missile","war","iran","israel","공습","공격","미사일","전쟁","이란","이스라엘"))
+    if cat in ("달러·국채금리","연준·금리"):
+        return any(w in low for w in ("yield","treasury","rate hike","hawkish","국채금리","금리 인상","매파"))
+    return False
+
+
+def _shock_signature(title):
+    """v15.2: 단일 카테고리보다 시장충격 연쇄를 먼저 감지한다."""
+    low=(title or "").lower()
+    geo=sum(1 for w in ("iran","israel","u.s."," us ","strike","airstrike","missile","attack","retaliat","hormuz","이란","이스라엘","미국","공습","미사일","공격","보복","호르무즈") if w in low)
+    oil=sum(1 for w in ("oil","crude","brent","wti","energy","유가","원유","브렌트","에너지") if w in low)
+    rates=sum(1 for w in ("yield","treasury","bond","rate hike","inflation","국채","금리","인플레이션","물가") if w in low)
+    risk=sum(1 for w in ("bitcoin","crypto","stocks","nasdaq","risk off","selloff","slump","falls","drop","비트코인","코인","증시","위험회피","하락","급락") if w in low)
+    # 지정학+유가, 유가+금리, 또는 지정학+위험자산의 2단 연결만 있어도 충격 후보.
+    score=min(geo,3)*4 + min(oil,2)*4 + min(rates,2)*3 + min(risk,2)*4
+    chain=(geo>0 and oil>0) or (oil>0 and rates>0) or (geo>0 and risk>0) or (oil>0 and risk>0)
+    return score, chain, {"geo":geo,"oil":oil,"rates":rates,"risk":risk}
 
 def _v133_stale_btc_price_title(title, btc_krw):
     """Only reject titles with an explicit BTC USD price far from current Coinone BTC.
@@ -1735,7 +1729,9 @@ def market_cause_analysis_text(force_direction=None):
         ds=_macro_direction_score(title,direction); age=_news_age_hours(it)
         polarity=_headline_polarity(title)
         # 핵심 v12.5: 가격 방향과 명백히 반대인 제목은 원인 근거에서 제외.
-        if polarity and polarity != expected:
+        shock_score, shock_chain, shock_parts = _shock_signature(title)
+        cross_asset = (direction=="DOWN" and (_is_cross_asset_catalyst(title,cat) or shock_chain))
+        if polarity and polarity != expected and not cross_asset:
             rejected_opposite += 1
             continue
         # v13.4 minimal guard: do not reject undated articles; only reject an
@@ -1751,12 +1747,13 @@ def market_cause_analysis_text(force_direction=None):
         direct=_direct_event_score(title,cat)
         forecast_penalty=5 if _is_forecast_or_preview(title) else 0
         direction_bonus=5 if polarity==expected else 0
-        total=ds*3 + sourceq*2 + freshness + relevance + direct*2 + direction_bonus + min(catsupport,2)*2 - forecast_penalty
+        catalyst_bonus=(12 if cross_asset else 0) + (min(shock_score,20) if direction=="DOWN" and shock_chain else 0)
+        total=ds*3 + sourceq*2 + freshness + relevance + direct*2 + direction_bonus + catalyst_bonus + min(catsupport,2)*2 - forecast_penalty
         # v13.4: 카테고리 핵심근거가 없는 기사(예: Solana disinflation)는 원인 후보에서 제외.
         if cat!="시장 수급·기타" and catsupport<=0:
             continue
         # 전망성 기사 단독 또는 방향성 없는 약한 기사는 1순위 원인으로 올라오지 못하게 문턱 강화.
-        if total>=10 and (ds>0 or direct>=2):
+        if total>=10 and (ds>0 or direct>=2 or cross_asset):
             ranked.append((total,ds,sourceq,freshness,cat,age,it,direct,forecast_penalty,polarity,catsupport))
     ranked.sort(key=lambda x:(x[0],x[2],x[7],-x[5]),reverse=True)
 
@@ -1789,6 +1786,9 @@ def market_cause_analysis_text(force_direction=None):
             'Bitcoin Fed chair hawkish rate hike crypto falls',
             'Bitcoin regulation law SEC crypto selloff',
             'Bitcoin geopolitical tariff risk assets selloff',
+            'US Iran strikes missiles Hormuz oil Brent WTI risk off Bitcoin',
+            'Middle East war oil surge Treasury yields stocks Bitcoin crypto',
+            '미국 이란 공습 미사일 호르무즈 유가 급등 비트코인 하락',
         ]
         emergency=[]
         # 먼저 영구 거시풀/검색어별 stale 캐시를 최대한 합친다.
@@ -1826,7 +1826,8 @@ def market_cause_analysis_text(force_direction=None):
             # 긴급복구는 72시간까지 허용하되 오래된 근거는 강하게 감점한다.
             if age < 999 and age > 72: continue
             polarity=_headline_polarity(title)
-            if polarity==1: continue
+            cross_asset=(direction=="DOWN" and _is_cross_asset_catalyst(title,cat))
+            if polarity==1 and not cross_asset: continue
             stale_price,_=_v133_stale_btc_price_title(title,btcprice)
             if stale_price: continue
             ds=_macro_direction_score(title,"DOWN")
@@ -1834,9 +1835,9 @@ def market_cause_analysis_text(force_direction=None):
             sourceq=_source_quality(it.get("source"))
             forecast=_is_forecast_or_preview(title)
             freshness=_cause_time_weight(age)
-            total=ds*3 + sourceq*2 + freshness + direct*2 + min(catsupport,2)*2 - (5 if forecast else 0)
-            # 명백한 하락 방향 또는 실제 사건/발언이 있어야 원인으로 채택한다.
-            if total>=9 and (ds>0 or direct>=2):
+            total=ds*3 + sourceq*2 + freshness + direct*2 + (12 if cross_asset else 0) + min(catsupport,2)*2 - (5 if forecast else 0)
+            # 교차자산 촉매(전쟁/유가/금리)는 제목 자체가 상승이어도 BTC 하락 원인이 될 수 있다.
+            if total>=9 and (ds>0 or direct>=2 or cross_asset):
                 eranked.append((total,ds,sourceq,freshness,cat,age,it,direct,5 if forecast else 0,polarity,catsupport))
         eranked.sort(key=lambda x:(x[0],x[2],x[7],-x[5]),reverse=True)
         # v14.6: 0~12h 직접원인 > 12~24h 최근원인 > 24~72h 배경원인.
@@ -1868,7 +1869,7 @@ def market_cause_analysis_text(force_direction=None):
     confidence=max(20,min(94,confidence))
 
     label="상승" if direction=="UP" else "하락"
-    parts=[f"🌐 【현재 시장 {label} 원인 분석 v14.6】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
+    parts=[f"🌐 【현재 시장 {label} 원인 분석 v15.2】",f"BTC {btcprice:,.0f}원 · 1분 {btc1:+.2f}% · 5분 {btc5:+.2f}% · 당일 기준 {btc24:+.2f}%",""]
     if news_collect_error:
         parts += ["⚠️ 실시간 뉴스 수집 오류를 격리하고 영구 캐시로 계속 분석", ""]
     if NEWS_HEALTH.get("last_errors",0):
@@ -2329,23 +2330,6 @@ def run_signaltest(cid):
 
 
 
-
-def run_voltest(cid):
-    """v15.1: strategic volume alert dry-run. No portfolio/order/state mutation."""
-    send("🧪 /voltest — 전략적 거래량 중요알림 테스트 시작\n※ 실제 주문·보유수량·현금·최고수익 값은 변경하지 않습니다.", cid)
-    cases=[
-        ("KAIA",40.83,0.80,3.50,2.40,2.80),
-        ("WLD",1000.00,-2.20,4.20,3.10,1.70),
-    ]
-    for symbol,price,move,r5,r15,r24 in cases:
-        d={
-            "price":price,"ret5m":move,
-            "volume":{"ready":True,"r5":r5,"r15":r15,"r24":r24,"pct24":(r24-1)*100,"level":3}
-        }
-        send("【테스트 — 실제 신호 아님】\n"+volume_alert_text(symbol,d),cid)
-        time.sleep(0.5)
-    send("✅ /voltest 완료\nKAIA 선행수급 + WLD 하락투매 2개 알림이 모두 도착하면 거래량 중요알림 표시 기능 통과.\n※ 실시간 Coinone 캔들 수집 자체는 /status의 5분·15분·24시간 거래량 수치로 별도 확인합니다.",cid)
-
 def evaluate_test_case(gain, price_dd, profit_dd, score, ret1=0.0, ret5=0.0, vol_ratio=1.0):
     # strategy() 핵심 우선순위와 동일하게 테스트
     if price_dd <= -25:
@@ -2401,7 +2385,6 @@ def engine_test_results():
         results.append({
             "name":name,"gain":gain,"price_dd":price_dd,"profit_dd":profit_dd,
             "score":score,"ret1":ret1,"ret5":ret5,"vol_ratio":vol_ratio,
-            "volume":volume,
             "expected":expected,"actual":actual,"ok":ok
         })
     return all_ok,results
@@ -2642,7 +2625,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v15.1 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/lead WLD·KAIA 선행호재 레이다\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/voltest 거래량 중요알림 테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send("✅ Jaina Coin Monitor v14.6 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/lead WLD·KAIA 선행호재 레이다\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
             elif text.startswith("/lead"):
                 send_long(leading_catalyst_text(),cid)
             elif text.startswith("/radar"):
@@ -2741,7 +2724,7 @@ def telegram_loop():
                     print("[Telegram] /trend error", repr(e), flush=True)
                     send(f"⚠️ 추세 조회 오류: {type(e).__name__}: {e}", cid)
             elif text.split()[0].split("@")[0].lower() == "/version" if text else False:
-                send("✅ Jaina Coin Monitor v15.1 실행 중", cid)
+                send("✅ Jaina Coin Monitor v12.3 실행 중", cid)
             elif text.split()[0].split("@")[0].lower() == "/booktest" if text else False:
                 # 먼저 수신 확인을 보내므로, 긴 테스트 전에 명령 수신 여부를 즉시 알 수 있다.
                 send("🧪 /booktest 명령 수신 — 장부 무변경 안전 테스트 시작", cid)
@@ -2754,8 +2737,6 @@ def telegram_loop():
                     send(f"⚠️ 장부 테스트 실패: {type(e).__name__}: {e}",cid)
             elif text.startswith("/enginetest"):
                 run_enginetest(cid)
-            elif text.startswith("/voltest"):
-                run_voltest(cid)
             elif text.startswith("/signaltest"):
                 run_signaltest(cid)
             elif text.startswith("/autotest"):
