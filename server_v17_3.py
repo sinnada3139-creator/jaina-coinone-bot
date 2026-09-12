@@ -11,10 +11,7 @@ from flask import Flask, jsonify, render_template_string
 import re
 
 app = Flask(__name__)
-COINS = {
-    "WLD":{"avg":486.5623,"qty":181196.28957743},
-    "KAIA":{"avg":35.1224,"qty":1028432.4910678}
-}
+COINS = {"WLD":{"avg":452.0,"qty":192495},"KAIA":{"avg":35.0,"qty":1131289}}
 URL = "https://api.coinone.co.kr/public/v2/ticker_new/KRW"
 SESSION = requests.Session()
 NEWS_HEALTH = {"last_errors":0, "last_ok":0, "last_ts":0.0, "circuit_until":0.0}
@@ -383,28 +380,6 @@ def record_cashset(symbol, amount, reason=""):
         })
         save_persistent_state()
         return {"symbol":symbol,"before":before,"cash":amount,"reason":reason or ""}
-
-
-def record_positionset(symbol, qty, avg, reason=""):
-    """실제 거래소 보유수량/평단에 맞춰 장부 포지션만 정정한다."""
-    symbol=normalize_symbol(symbol)
-    qty=safe_float(qty); avg=safe_float(avg)
-    if not symbol:
-        raise ValueError("코인은 W 또는 K로 입력하세요.")
-    if qty < 0 or avg <= 0:
-        raise ValueError("보유수량/평단을 확인하세요.")
-    with LOCK:
-        l=LEDGER[symbol]
-        before_qty=float(l.get("qty",0.0)); before_avg=float(l.get("avg",0.0))
-        l["qty"]=qty; l["avg"]=avg
-        l["trades"].append({
-            "ts":int(time.time()),"side":"POSITION_SET","qty":qty,"price":avg,
-            "before_qty":before_qty,"before_avg":before_avg,"reason":reason or ""
-        })
-        COINS[symbol]["qty"]=qty; COINS[symbol]["avg"]=avg
-        save_persistent_state()
-        return {"symbol":symbol,"before_qty":before_qty,"before_avg":before_avg,
-                "qty":qty,"avg":avg,"reason":reason or ""}
 
 def position_text():
     lines=["📒 【자이나 매매장부】"]
@@ -1740,7 +1715,7 @@ def _news_age_hours(item):
 
 
 def _macro_news(direction="DOWN"):
-    """v13.0: Bing/직접 RSS/Google/캐시 다중경로 + 24h→48h 심층검색."""
+    """v17.3: scheduled US macro releases are always searched around announcement windows."""
     stage1 = [
         'Bitcoin Federal Reserve chair speech interest rates crypto when:1d',
         'Bitcoin Fed hawkish dovish Treasury yields dollar crypto when:1d',
@@ -1752,6 +1727,14 @@ def _macro_news(direction="DOWN"):
         '미국 이란 공습 미사일 호르무즈 유가 비트코인 코인 하락 when:1d',
         '비트코인 연준 의장 금리 국채 달러 가상자산 when:1d',
         '비트코인 청산 ETF 유출 옵션 만기 규제 해킹 when:1d',
+    ]
+    # v17.3 EVENT BRIDGE: CPI/PPI/jobs/FOMC releases must not disappear merely because
+    # generic crypto headlines are already plentiful. These queries run in both directions.
+    stage1 += [
+        'US CPI released today actual forecast Federal Reserve Bitcoin crypto when:1d',
+        'US PPI released today actual forecast Federal Reserve Bitcoin crypto when:1d',
+        'US jobs payroll unemployment released today actual forecast Bitcoin crypto when:1d',
+        'FOMC Federal Reserve decision statement today Bitcoin crypto when:1d',
     ]
     if direction == "UP":
         stage1 += ['Bitcoin crypto rally rate cut dovish ETF inflow rebound when:1d']
@@ -1826,6 +1809,18 @@ def _macro_news(direction="DOWN"):
         searched, err1=collect_parallel(urgent, limit=8)
         first=_dedupe_news(first + searched)
 
+    # v17.3: irrespective of cache size, pull current scheduled macro-result headlines.
+    # This closes the gap where the pre-event radar knew CPI/PPI but /cause said 'no direct cause'.
+    event_queries=[
+        'US CPI released today actual forecast Bitcoin crypto when:1d',
+        'US PPI released today actual forecast Bitcoin crypto when:1d',
+        'US payroll jobs report released today actual forecast Bitcoin crypto when:1d',
+        'Federal Reserve FOMC decision today statement Bitcoin crypto when:1d',
+    ]
+    ev_items, ev_err=collect_parallel(event_queries, limit=7)
+    if ev_err: err1.extend(ev_err)
+    first=_dedupe_news(ev_items + first)
+
     # v13.8 핵심: 현재 요청들이 timeout이어도 이전에 성공한 모든 거시 증거를
     # 검색어별 캐시와 별개인 영구 풀에서 병합한다. Render 재시작 후에도 복원됨.
     first=_dedupe_news(first + _macro_pool_get(80))
@@ -1897,6 +1892,17 @@ def _category_support_score(title, cat):
         "관세": ("tariff","관세"),
     }
     return sum(1 for w in anchors.get(cat,()) if w in low)
+
+def _scheduled_macro_release_score(title, age_hours):
+    """v17.3: recognize an ACTUAL scheduled US macro release near market movement."""
+    low=(title or "").lower()
+    macro=("cpi","consumer price","ppi","producer price","payroll","jobs report","employment situation","unemployment","fomc","federal reserve decision","소비자물가","생산자물가","고용보고서","비농업","실업률","연준 결정")
+    actual=("rose","fell","increased","decreased","comes in","came in","actual","released","release","report shows","moves up","moves down","발표","상승","하락","증가","감소")
+    if not any(w in low for w in macro): return 0
+    if _is_forecast_or_preview(title): return 0
+    if age_hours < 999 and age_hours <= 3: return 18
+    if age_hours < 999 and age_hours <= 8: return 10
+    return 4 if any(w in low for w in actual) else 0
 
 def _macro_direction_score(title, direction):
     low=(title or "").lower()
@@ -2138,12 +2144,13 @@ def market_cause_analysis_text(force_direction=None):
         forecast_penalty=5 if _is_forecast_or_preview(title) else 0
         direction_bonus=5 if polarity==expected else 0
         catalyst_bonus=(12 if cross_asset else 0) + (min(shock_score,20) if direction=="DOWN" and shock_chain else 0)
-        total=ds*3 + sourceq*2 + freshness + relevance + direct*2 + direction_bonus + catalyst_bonus + min(catsupport,2)*2 - forecast_penalty
+        event_bonus=_scheduled_macro_release_score(title, age)
+        total=ds*3 + sourceq*2 + freshness + relevance + direct*2 + direction_bonus + catalyst_bonus + event_bonus + min(catsupport,2)*2 - forecast_penalty
         # v13.4: 카테고리 핵심근거가 없는 기사(예: Solana disinflation)는 원인 후보에서 제외.
         if cat!="시장 수급·기타" and catsupport<=0:
             continue
         # 전망성 기사 단독 또는 방향성 없는 약한 기사는 1순위 원인으로 올라오지 못하게 문턱 강화.
-        if total>=10 and (ds>0 or direct>=2 or cross_asset):
+        if total>=10 and (ds>0 or direct>=2 or cross_asset or event_bonus>=10):
             ranked.append((total,ds,sourceq,freshness,cat,age,it,direct,forecast_penalty,polarity,catsupport))
     ranked.sort(key=lambda x:(x[0],x[2],x[7],-x[5]),reverse=True)
 
@@ -2887,6 +2894,23 @@ def run_signaltest(cid):
     send("✅ /signaltest 완료 — 위 6개 메시지가 모두 즉시 도착하면 상승·하락 초기 포함 중요신호 알림 통과", cid)
 
 
+def run_reversaltest(cid):
+    """상승 초기 뒤 하락으로 방향이 뒤집힐 때 새 중요알람 대상으로 인식하는지 무변경 테스트."""
+    send("🧪 상승→재하락 방향전환 테스트를 시작합니다. (실제 장부/주문 무변경)", cid)
+    up={"ret1m":0.85,"ret5m":1.80,"vol_ratio":1.40}
+    down={"ret1m":-0.90,"ret5m":-1.90,"vol_ratio":1.45}
+    us,ud,um,ub=early_move_status(up)
+    ds,dd,dm,db=early_move_status(down)
+    up_ok=(us>0 and ud=="UP")
+    down_ok=(ds>0 and dd=="DOWN")
+    reversal_ok=up_ok and down_ok and ud!=dd
+    send(("📈 1단계 상승 감지 " + ("✅" if up_ok else "❌") + f" — {ub} {um:+.2f}% · 단계 {us}\n"
+          "📉 2단계 재하락 감지 " + ("✅" if down_ok else "❌") + f" — {db} {dm:+.2f}% · 단계 {ds}\n"
+          "🔄 UP→DOWN 방향전환 새 중요알람 판정 " + ("✅" if reversal_ok else "❌") + "\n\n"
+          + ("🎉 /reversaltest 통과 — 상승 후 재하락을 새 방향전환으로 감지합니다." if reversal_ok else "⚠️ /reversaltest 실패 — 방향전환 로직 점검 필요")
+          + "\n※ 가상 변동률 테스트이며 가격·수량·현금·장부는 변경하지 않습니다."), cid)
+
+
 
 def evaluate_test_case(gain, price_dd, profit_dd, score, ret1=0.0, ret5=0.0, vol_ratio=1.0):
     # strategy() 핵심 우선순위와 동일하게 테스트
@@ -3196,7 +3220,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v17.3 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/positionset W 181196.28957743 486.5623 실제잔고정정\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/buyplan W 585 560 525 680 예약매수·돌파계획\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/lead WLD·KAIA 선행호재 레이다\n/agidiag AGI→WLD 뉴스수집 진단\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send(f"✅ Jaina Coin Monitor v{BOT_VERSION} 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/buyplan W 585 560 525 680 예약매수·돌파계획\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/lead WLD·KAIA 선행호재 레이다\n/agidiag AGI→WLD 뉴스수집 진단\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/reversaltest 상승→재하락 전환 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
             elif text.split()[0].split("@")[0].lower() == "/agidiag" if text else False:
                 send("🧪 AGI→WLD 다중 뉴스소스를 백그라운드에서 진단합니다.", cid)
                 def _agidiag_worker(chat_id):
@@ -3306,21 +3330,6 @@ def telegram_loop():
                     )
                 except Exception as e:
                     send(f"⚠️ 인출 기록 실패: {e}",cid)
-            elif text.startswith("/positionset"):
-                try:
-                    p=text.split(maxsplit=4)
-                    if len(p)<4:
-                        raise ValueError("사용법: /positionset W 181196.28957743 486.5623 실제잔고정정")
-                    reason=p[4] if len(p)>4 else ""
-                    r=record_positionset(p[1],p[2],p[3],reason)
-                    short="W" if r["symbol"]=="WLD" else "K"
-                    send(
-                        f"✅ {short} 실제 포지션 정정 완료\n"
-                        f"정정 전 {qty_text(r['before_qty'])}개 / {r['before_avg']:,.4f}원\n"
-                        f"정정 후 {qty_text(r['qty'])}개 / {r['avg']:,.4f}원\n"
-                        f"※ 재매수 현금·실현손익 누계는 변경하지 않음", cid)
-                except Exception as e:
-                    send(f"⚠️ 포지션 정정 실패: {e}",cid)
             elif text.startswith("/position"):
                 send(position_text(),cid)
             elif text.split()[0].split("@")[0].lower() == "/trend" if text else False:
@@ -3346,6 +3355,8 @@ def telegram_loop():
                 run_enginetest(cid)
             elif text.startswith("/signaltest"):
                 run_signaltest(cid)
+            elif text.startswith("/reversaltest"):
+                run_reversaltest(cid)
             elif text.startswith("/autotest"):
                 send("🧪 17분 자동보고 기능을 즉시 테스트합니다.", cid)
                 send_summary_once(cid)
