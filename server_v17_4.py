@@ -11,10 +11,7 @@ from flask import Flask, jsonify, render_template_string
 import re
 
 app = Flask(__name__)
-COINS = {
-    "WLD":{"avg":486.5623,"qty":181196.28957743},
-    "KAIA":{"avg":35.1224,"qty":1028432.4910678}
-}
+COINS = {"WLD":{"avg":452.0,"qty":192495},"KAIA":{"avg":35.0,"qty":1131289}}
 URL = "https://api.coinone.co.kr/public/v2/ticker_new/KRW"
 SESSION = requests.Session()
 NEWS_HEALTH = {"last_errors":0, "last_ok":0, "last_ts":0.0, "circuit_until":0.0}
@@ -383,28 +380,6 @@ def record_cashset(symbol, amount, reason=""):
         })
         save_persistent_state()
         return {"symbol":symbol,"before":before,"cash":amount,"reason":reason or ""}
-
-
-def record_positionset(symbol, qty, avg, reason=""):
-    """실제 거래소 보유수량/평단에 맞춰 장부 포지션만 정정한다."""
-    symbol=normalize_symbol(symbol)
-    qty=safe_float(qty); avg=safe_float(avg)
-    if not symbol:
-        raise ValueError("코인은 W 또는 K로 입력하세요.")
-    if qty < 0 or avg <= 0:
-        raise ValueError("보유수량/평단을 확인하세요.")
-    with LOCK:
-        l=LEDGER[symbol]
-        before_qty=float(l.get("qty",0.0)); before_avg=float(l.get("avg",0.0))
-        l["qty"]=qty; l["avg"]=avg
-        l["trades"].append({
-            "ts":int(time.time()),"side":"POSITION_SET","qty":qty,"price":avg,
-            "before_qty":before_qty,"before_avg":before_avg,"reason":reason or ""
-        })
-        COINS[symbol]["qty"]=qty; COINS[symbol]["avg"]=avg
-        save_persistent_state()
-        return {"symbol":symbol,"before_qty":before_qty,"before_avg":before_avg,
-                "qty":qty,"avg":avg,"reason":reason or ""}
 
 def position_text():
     lines=["📒 【자이나 매매장부】"]
@@ -1740,7 +1715,7 @@ def _news_age_hours(item):
 
 
 def _macro_news(direction="DOWN"):
-    """v13.0: Bing/직접 RSS/Google/캐시 다중경로 + 24h→48h 심층검색."""
+    """v17.3: scheduled US macro releases are always searched around announcement windows."""
     stage1 = [
         'Bitcoin Federal Reserve chair speech interest rates crypto when:1d',
         'Bitcoin Fed hawkish dovish Treasury yields dollar crypto when:1d',
@@ -1752,6 +1727,16 @@ def _macro_news(direction="DOWN"):
         '미국 이란 공습 미사일 호르무즈 유가 비트코인 코인 하락 when:1d',
         '비트코인 연준 의장 금리 국채 달러 가상자산 when:1d',
         '비트코인 청산 ETF 유출 옵션 만기 규제 해킹 when:1d',
+    ]
+    # v17.3 EVENT BRIDGE: CPI/PPI/jobs/FOMC releases must not disappear merely because
+    # generic crypto headlines are already plentiful. These queries run in both directions.
+    stage1 += [
+        'US CPI released today actual forecast Federal Reserve Bitcoin crypto when:1d',
+        'US PPI released today actual forecast Federal Reserve Bitcoin crypto when:1d',
+        'US jobs payroll unemployment released today actual forecast Bitcoin crypto when:1d',
+        'FOMC Federal Reserve decision statement today Bitcoin crypto when:1d',
+        '"CLARITY Act" Senate vote cloture result Bitcoin crypto when:1d',
+        'H.R. 3633 crypto market structure Senate vote passed failed Bitcoin when:1d',
     ]
     if direction == "UP":
         stage1 += ['Bitcoin crypto rally rate cut dovish ETF inflow rebound when:1d']
@@ -1826,6 +1811,20 @@ def _macro_news(direction="DOWN"):
         searched, err1=collect_parallel(urgent, limit=8)
         first=_dedupe_news(first + searched)
 
+    # v17.3: irrespective of cache size, pull current scheduled macro-result headlines.
+    # This closes the gap where the pre-event radar knew CPI/PPI but /cause said 'no direct cause'.
+    event_queries=[
+        'US CPI released today actual forecast Bitcoin crypto when:1d',
+        'US PPI released today actual forecast Bitcoin crypto when:1d',
+        'US payroll jobs report released today actual forecast Bitcoin crypto when:1d',
+        'Federal Reserve FOMC decision today statement Bitcoin crypto when:1d',
+        '"CLARITY Act" Senate vote cloture result Bitcoin crypto when:1d',
+        'H.R. 3633 Senate crypto bill vote passed failed when:1d',
+    ]
+    ev_items, ev_err=collect_parallel(event_queries, limit=7)
+    if ev_err: err1.extend(ev_err)
+    first=_dedupe_news(ev_items + first)
+
     # v13.8 핵심: 현재 요청들이 timeout이어도 이전에 성공한 모든 거시 증거를
     # 검색어별 캐시와 별개인 영구 풀에서 병합한다. Render 재시작 후에도 복원됨.
     first=_dedupe_news(first + _macro_pool_get(80))
@@ -1870,7 +1869,7 @@ def _macro_category(title):
         ("달러·국채금리", ("treasury","yield","bond yield","dollar","dxy","국채","국채금리","달러")),
         ("ETF 자금", ("etf","inflow","outflow","spot bitcoin etf","ETF","유입","유출")),
         ("레버리지·옵션", ("liquidation","liquidated","leverage","options expiry","option expiry","청산","레버리지","옵션 만기")),
-        ("규제·법률", ("regulation","regulator","sec ","ban","lawsuit","규제","당국","소송","금지")),
+        ("규제·법률", ("regulation","regulator","sec ","clarity act","h.r. 3633","hr 3633","cloture","crypto bill","market structure bill","ban","lawsuit","규제","법안","표결","당국","소송","금지")),
         ("해킹·보안", ("hack","exploit","breach","해킹","익스플로잇","보안")),
         ("에너지·유가", ("oil","crude","brent","wti","energy price","oil price","oil prices","hormuz","유가","원유","브렌트","wti","에너지 가격","호르무즈")),
         ("지정학·전쟁", ("war ","conflict","strike","strikes","airstrike","missile","attack","iran","israel","hormuz","geopolitical","전쟁","분쟁","공습","미사일","공격","이란","이스라엘","호르무즈")),
@@ -1890,13 +1889,24 @@ def _category_support_score(title, cat):
         "달러·국채금리": ("treasury","yield","bond yield","dollar","dxy","국채","국채금리","달러"),
         "ETF 자금": ("bitcoin etf","spot bitcoin etf","btc etf","etf inflow","etf outflow","ETF 유입","ETF 유출","현물 ETF"),
         "레버리지·옵션": ("liquidation","liquidated","leverage","options expiry","option expiry","청산","레버리지","옵션 만기"),
-        "규제·법률": ("regulation","regulator","sec ","clarity act","lawsuit","ban","규제","당국","소송","금지"),
+        "규제·법률": ("regulation","regulator","sec ","clarity act","h.r. 3633","hr 3633","cloture","crypto bill","market structure bill","lawsuit","ban","규제","법안","표결","당국","소송","금지"),
         "해킹·보안": ("hack","exploit","breach","해킹","익스플로잇","보안"),
         "에너지·유가": ("oil","crude","brent","wti","oil price","oil prices","energy price","hormuz","유가","원유","브렌트","에너지 가격","호르무즈"),
         "지정학·전쟁": ("war ","conflict","strike","strikes","airstrike","missile","attack","iran","israel","hormuz","geopolitical","전쟁","분쟁","공습","미사일","공격","이란","이스라엘","호르무즈"),
         "관세": ("tariff","관세"),
     }
     return sum(1 for w in anchors.get(cat,()) if w in low)
+
+def _scheduled_macro_release_score(title, age_hours):
+    """v17.3: recognize an ACTUAL scheduled US macro release near market movement."""
+    low=(title or "").lower()
+    macro=("cpi","consumer price","ppi","producer price","payroll","jobs report","employment situation","unemployment","fomc","federal reserve decision","소비자물가","생산자물가","고용보고서","비농업","실업률","연준 결정")
+    actual=("rose","fell","increased","decreased","comes in","came in","actual","released","release","report shows","moves up","moves down","발표","상승","하락","증가","감소")
+    if not any(w in low for w in macro): return 0
+    if _is_forecast_or_preview(title): return 0
+    if age_hours < 999 and age_hours <= 3: return 18
+    if age_hours < 999 and age_hours <= 8: return 10
+    return 4 if any(w in low for w in actual) else 0
 
 def _macro_direction_score(title, direction):
     low=(title or "").lower()
@@ -2138,12 +2148,13 @@ def market_cause_analysis_text(force_direction=None):
         forecast_penalty=5 if _is_forecast_or_preview(title) else 0
         direction_bonus=5 if polarity==expected else 0
         catalyst_bonus=(12 if cross_asset else 0) + (min(shock_score,20) if direction=="DOWN" and shock_chain else 0)
-        total=ds*3 + sourceq*2 + freshness + relevance + direct*2 + direction_bonus + catalyst_bonus + min(catsupport,2)*2 - forecast_penalty
+        event_bonus=_scheduled_macro_release_score(title, age)
+        total=ds*3 + sourceq*2 + freshness + relevance + direct*2 + direction_bonus + catalyst_bonus + event_bonus + min(catsupport,2)*2 - forecast_penalty
         # v13.4: 카테고리 핵심근거가 없는 기사(예: Solana disinflation)는 원인 후보에서 제외.
         if cat!="시장 수급·기타" and catsupport<=0:
             continue
         # 전망성 기사 단독 또는 방향성 없는 약한 기사는 1순위 원인으로 올라오지 못하게 문턱 강화.
-        if total>=10 and (ds>0 or direct>=2 or cross_asset):
+        if total>=10 and (ds>0 or direct>=2 or cross_asset or event_bonus>=10):
             ranked.append((total,ds,sourceq,freshness,cat,age,it,direct,forecast_penalty,polarity,catsupport))
     ranked.sort(key=lambda x:(x[0],x[2],x[7],-x[5]),reverse=True)
 
@@ -2447,15 +2458,6 @@ def rapid_cause_text(symbol, d):
     peer1=peer.get("ret1"); peer5=peer.get("ret5")
     sign=1 if direction=="UP" else -1
     reasons=[]; confidence=20
-    event_ctx=recent_event_context(direction,4*3600)
-    if event_ctx:
-        age=max(0,(time.time()-event_ctx.get('ts',time.time()))/60)
-        if event_ctx.get('direction') in ('RISK_ON','RISK_OFF'):
-            reasons.append(f"미국 {event_ctx.get('name')} 발표 결과와 방향·시간대 일치 ({age:.0f}분 전 감지)")
-            confidence += 35
-        else:
-            reasons.append(f"미국 {event_ctx.get('name')} 발표 직후 구간 — 시장 반응과 재검증 중")
-            confidence += 15
 
     btc_aligned=((btc1 is not None and sign*btc1>=0.8) or (btc5 is not None and sign*btc5>=1.5))
     peer_aligned=((peer1 is not None and sign*peer1>=1.5) or (peer5 is not None and sign*peer5>=3.0))
@@ -2517,10 +2519,6 @@ def rapid_cause_text(symbol, d):
         for _,_,it in matching[:2]:
             src=f" · {it.get('source')}" if it.get('source') else ""
             parts.append(f"• {it.get('title','')}{src}\n{it.get('link','')}")
-    if event_ctx:
-        src=f" · {event_ctx.get('source')}" if event_ctx.get('source') else ""
-        parts.append(f"\n🇺🇸 직전 주요 이벤트\n• {event_ctx.get('name')}: {event_ctx.get('title','')}{src}")
-        if event_ctx.get('link'): parts.append(event_ctx.get('link'))
     if direction=="DOWN":
         parts.append("\n⚠️ 대응: 추격매도보다 BTC 동조·15분/4시간 추세 훼손·거래량 지속 여부를 함께 확인")
     else:
@@ -2900,6 +2898,23 @@ def run_signaltest(cid):
     send("✅ /signaltest 완료 — 위 6개 메시지가 모두 즉시 도착하면 상승·하락 초기 포함 중요신호 알림 통과", cid)
 
 
+def run_reversaltest(cid):
+    """상승 초기 뒤 하락으로 방향이 뒤집힐 때 새 중요알람 대상으로 인식하는지 무변경 테스트."""
+    send("🧪 상승→재하락 방향전환 테스트를 시작합니다. (실제 장부/주문 무변경)", cid)
+    up={"ret1m":0.85,"ret5m":1.80,"vol_ratio":1.40}
+    down={"ret1m":-0.90,"ret5m":-1.90,"vol_ratio":1.45}
+    us,ud,um,ub=early_move_status(up)
+    ds,dd,dm,db=early_move_status(down)
+    up_ok=(us>0 and ud=="UP")
+    down_ok=(ds>0 and dd=="DOWN")
+    reversal_ok=up_ok and down_ok and ud!=dd
+    send(("📈 1단계 상승 감지 " + ("✅" if up_ok else "❌") + f" — {ub} {um:+.2f}% · 단계 {us}\n"
+          "📉 2단계 재하락 감지 " + ("✅" if down_ok else "❌") + f" — {db} {dm:+.2f}% · 단계 {ds}\n"
+          "🔄 UP→DOWN 방향전환 새 중요알람 판정 " + ("✅" if reversal_ok else "❌") + "\n\n"
+          + ("🎉 /reversaltest 통과 — 상승 후 재하락을 새 방향전환으로 감지합니다." if reversal_ok else "⚠️ /reversaltest 실패 — 방향전환 로직 점검 필요")
+          + "\n※ 가상 변동률 테스트이며 가격·수량·현금·장부는 변경하지 않습니다."), cid)
+
+
 
 def evaluate_test_case(gain, price_dd, profit_dd, score, ret1=0.0, ret5=0.0, vol_ratio=1.0):
     # strategy() 핵심 우선순위와 동일하게 테스트
@@ -2978,13 +2993,6 @@ def run_enginetest(cid):
 EVENT_RADAR_INTERVAL = 15 * 60
 EVENT_RADAR_LAST_DAILY = ""
 EVENT_RADAR_SENT = set()
-# v17.4: 발표 결과를 가격 움직임보다 먼저 저장하고 이후 원인 레이더와 역매칭.
-EVENT_RESULT_INTERVAL = 90
-EVENT_RESULT_SENT = set()
-EVENT_CONTEXT = deque(maxlen=12)   # {ts,name,level,title,link,source,direction}
-EVENT_CONTEXT_LOCK = threading.RLock()
-EVENT_RESULT_WINDOW_BEFORE = 10 * 60
-EVENT_RESULT_WINDOW_AFTER = 3 * 3600
 KST = timezone(timedelta(hours=9))
 US_ET = timezone(timedelta(hours=-4))  # do not shadow xml.etree.ElementTree alias ET
 
@@ -2994,6 +3002,7 @@ SCHEDULED_MARKET_EVENTS = [
     ("2026-09-04T08:30:00-04:00","🔴","미국 고용보고서","연준 금리경로 핵심 지표 → 주식·BTC 변동성 확대 가능"),
     ("2026-09-10T08:30:00-04:00","🟠","미국 PPI","물가 압력 확인 → 금리·달러·BTC 영향 가능"),
     ("2026-09-11T08:30:00-04:00","🔴","미국 CPI","인플레이션 핵심 지표 → 주식·BTC 급변 가능"),
+    ("2026-09-15T14:15:00-04:00","🔴","미 상원 CLARITY Act 절차표결","H.R. 3633 motion-to-proceed cloture · 60표 문턱 → 코인 규제·시장구조 핵심 이벤트 (최종통과 표결 아님)"),
     ("2026-09-16T14:00:00-04:00","🔴","FOMC 금리결정·성명","연준 정책·점도표·기자회견 → 최중요 시장 이벤트"),
     ("2026-09-29T10:00:00-04:00","🟠","미국 JOLTS","고용 수요 변화 → 금리 기대 영향"),
     ("2026-10-02T08:30:00-04:00","🔴","미국 고용보고서","연준 금리경로 핵심 지표"),
@@ -3024,7 +3033,9 @@ def upcoming_scheduled_events(hours=168):
 def dynamic_policy_radar(limit=4):
     # Upcoming crypto regulation/ETF/legal catalysts. Only surface articles whose titles explicitly signal a future action.
     queries=[
-        'US crypto bill vote hearing deadline SEC CFTC stablecoin market structure when:7d',
+        '"CLARITY Act" H.R. 3633 Senate cloture vote amendment result when:7d',
+        '"Digital Asset Market Clarity Act" Senate vote procedural cloture 60 votes when:7d',
+        'US crypto market structure bill Senate vote hearing deadline SEC CFTC stablecoin when:7d',
         'Bitcoin crypto ETF SEC decision deadline approval when:7d',
         'Worldcoin WLD World Network World ID OpenAI ChatGPT Sam Altman AI agent proof of human partnership launch regulation unlock upcoming when:7d',
         'KAIA Kaia blockchain KRW won stablecoin Korea bank Kakao LINE RWA payment partnership regulation governance tokenomics upcoming when:7d',
@@ -3042,6 +3053,85 @@ def dynamic_policy_radar(limit=4):
         except Exception:
             pass
     return rows[:limit]
+
+
+# v17.4: dedicated CLARITY Act legislative radar.
+# Generic policy search was too broad and could miss the market-structure bill during a fast vote cycle.
+CLARITY_QUERIES = [
+    '"CLARITY Act" Senate vote cloture H.R. 3633 when:2d',
+    '"Digital Asset Market Clarity Act" Senate vote result amendment when:2d',
+    'H.R. 3633 crypto Senate cloture motion to proceed when:2d',
+    'CLARITY Act crypto 60 votes passed failed delayed postponed amendment when:2d',
+]
+CLARITY_LAST = {}
+CLARITY_COOLDOWN = 45 * 60
+
+def _clarity_stage(title):
+    low=(title or '').lower()
+    if not any(k in low for k in ('clarity act','digital asset market clarity','h.r. 3633','hr 3633')):
+        return None
+    # Results outrank previews so a vote outcome cannot be buried by older preview stories.
+    if any(k in low for k in ('passes','passed','advances','advanced','cloture invoked','60 votes','approved','fails','failed','rejected','blocked','stalls','stalled','vote result','표결 결과','가결','부결','통과','무산')):
+        return ('RESULT','🔴')
+    if any(k in low for k in ('delay','delayed','postpone','postponed','rescheduled','연기','보류')):
+        return ('CHANGE','🔴')
+    if any(k in low for k in ('amendment','amended','revised','final text','deal','agreement','ethics provision','수정안','합의','최종안')):
+        return ('UPDATE','🟠')
+    if any(k in low for k in ('vote','cloture','motion to proceed','scheduled','tuesday','hearing','표결','예정','청문')):
+        return ('PREVIEW','🟠')
+    return ('NEWS','⚪')
+
+def clarity_radar_rows(limit=8):
+    rows=[]; seen=set()
+    for q in CLARITY_QUERIES:
+        try:
+            items,errs=multisource_news(q,7,priority=True)
+            for it in items:
+                title=(it.get('title') or '').strip()
+                stage=_clarity_stage(title)
+                if not title or not stage: continue
+                age=_news_age_hours(it)
+                if age > 72: continue
+                key=title.lower()[:180]
+                if key in seen: continue
+                seen.add(key); rows.append((stage[0],stage[1],age,it))
+        except Exception as e:
+            print('[ClarityRadar]',type(e).__name__,flush=True)
+    rank={'RESULT':0,'CHANGE':1,'UPDATE':2,'PREVIEW':3,'NEWS':4}
+    rows.sort(key=lambda x:(rank.get(x[0],9),x[2]))
+    return rows[:limit]
+
+def clarity_radar_text():
+    parts=['🏛️ 【CLARITY Act 전용 레이더】',
+           'H.R. 3633 · 미 상원 시장구조 법안 집중감시']
+    rows=clarity_radar_rows(8)
+    if not rows:
+        parts.append('• 최근 72시간 내 확인 가능한 신규 기사 없음')
+    else:
+        labels={'RESULT':'표결결과','CHANGE':'일정변경','UPDATE':'수정·협상','PREVIEW':'표결예고','NEWS':'관련뉴스'}
+        for stage,level,age,it in rows:
+            age_txt=f'{age:.1f}시간 전' if age < 48 else f'{age/24:.1f}일 전'
+            parts.append(f'{level} [{labels.get(stage,stage)}] {age_txt}\n{it.get("title","")}'+(f' · {it.get("source","")}' if it.get('source') else '')+f'\n{it.get("link","")}')
+    parts.append('※ cloture/motion-to-proceed는 최종 법안 통과와 구분해서 표시합니다.')
+    parts.append('※ 자동주문 없음')
+    return '\n'.join(parts)
+
+def clarity_radar_loop():
+    while True:
+        try:
+            if CHAT_ID:
+                now=time.time()
+                for stage,level,age,it in clarity_radar_rows(8):
+                    title=(it.get('title') or '').strip(); key=f'{stage}:{title.lower()[:180]}'
+                    # Preview stories are useful but results/changes are the highest-priority alerts.
+                    cooldown=CLARITY_COOLDOWN if stage in ('RESULT','CHANGE','UPDATE') else 3*3600
+                    if now-CLARITY_LAST.get(key,0) < cooldown: continue
+                    CLARITY_LAST[key]=now
+                    label={'RESULT':'표결 결과','CHANGE':'일정 변경','UPDATE':'법안 수정·협상','PREVIEW':'표결 사전예고','NEWS':'관련 뉴스'}.get(stage,stage)
+                    send_long(f'{level} 【CLARITY Act 중요알람】\n{label}\n{title}\n{it.get("link","")}\n→ BTC·WLD·KAIA 가격·거래량 후속반응 집중감시\n※ 절차표결과 최종통과를 구분해 판정',CHAT_ID)
+        except Exception as e:
+            print('[ClarityRadar] loop error',e,flush=True)
+        time.sleep(10*60)
 
 
 # v14.9: project-specific leading catalyst radar.
@@ -3172,97 +3262,6 @@ def event_radar_text():
     parts.append('※ 자동주문 없음')
     return '\n'.join(parts)
 
-def _event_result_direction(name, title):
-    """기사 제목만으로 과도하게 단정하지 않고, 명시적 물가/고용 방향 표현만 분류."""
-    low=(title or '').lower()
-    hot=('hotter than expected','above expectations','above forecast','higher than expected','accelerat','surpris','예상 상회','예상보다 높','가속')
-    cool=('cooler than expected','below expectations','below forecast','lower than expected','eas','soft','예상 하회','예상보다 낮','둔화')
-    if name in ('미국 CPI','미국 PPI'):
-        if any(x in low for x in hot): return 'RISK_OFF'
-        if any(x in low for x in cool): return 'RISK_ON'
-    if name in ('미국 고용보고서','미국 JOLTS'):
-        # 고용은 해석이 복합적이므로 기사에 시장 방향 표현이 있을 때만 방향 부여.
-        if any(x in low for x in ('stocks fall','yields rise','rate cut bets fade','달러 상승','금리인하 기대 약화')): return 'RISK_OFF'
-        if any(x in low for x in ('stocks rise','yields fall','rate cut bets rise','금리인하 기대 강화')): return 'RISK_ON'
-    return 'NEUTRAL'
-
-
-def _event_result_candidates(name):
-    qmap={
-        '미국 CPI':['US CPI actual expected inflation August 2026','US consumer price index August 2026 actual forecast'],
-        '미국 PPI':['US PPI actual expected producer prices August 2026','US producer price index August 2026 actual forecast'],
-        '미국 고용보고서':['US jobs report payrolls unemployment actual expected September 2026'],
-        '미국 JOLTS':['US JOLTS job openings actual expected 2026'],
-        'FOMC 금리결정·성명':['Federal Reserve FOMC rate decision September 2026 statement'],
-        'FOMC 의사록':['Federal Reserve FOMC minutes 2026'],
-    }
-    rows=[]
-    for q in qmap.get(name,[f'{name} actual expected result']):
-        try: rows += google_news_rss(q+' when:1d',6)
-        except Exception: pass
-    # 신뢰도 높은 출처와 제목 내 event 키워드를 우선.
-    keys={'미국 CPI':('cpi','consumer price'), '미국 PPI':('ppi','producer price'),
-          '미국 고용보고서':('jobs','payroll','employment'), '미국 JOLTS':('jolts','job openings'),
-          'FOMC 금리결정·성명':('fed','fomc','rate'), 'FOMC 의사록':('fed','fomc','minutes')}.get(name,())
-    out=[]; seen=set()
-    for it in _dedupe_news(rows):
-        title=(it.get('title') or '').strip(); low=title.lower()
-        if not title or (keys and not any(k in low for k in keys)): continue
-        k=low[:180]
-        if k in seen: continue
-        seen.add(k); out.append(it)
-    out.sort(key=lambda x: source_weight(x.get('source')), reverse=True)
-    return out[:5]
-
-
-def _remember_event_result(dt,level,name,it):
-    row={'ts':time.time(),'event_ts':dt.timestamp(),'name':name,'level':level,
-         'title':it.get('title',''),'link':it.get('link',''),'source':it.get('source',''),
-         'direction':_event_result_direction(name,it.get('title',''))}
-    with EVENT_CONTEXT_LOCK: EVENT_CONTEXT.append(row)
-    return row
-
-
-def recent_event_context(direction=None, max_age=4*3600):
-    now=time.time(); want='RISK_ON' if direction=='UP' else ('RISK_OFF' if direction=='DOWN' else None)
-    with EVENT_CONTEXT_LOCK: rows=[dict(x) for x in EVENT_CONTEXT if now-x.get('ts',0)<=max_age]
-    if want:
-        aligned=[x for x in rows if x.get('direction')==want]
-        if aligned: return aligned[-1]
-    return rows[-1] if rows else None
-
-
-def event_result_text(row):
-    d=row.get('direction'); mark='🔴' if d=='RISK_OFF' else ('🟢' if d=='RISK_ON' else '🟠')
-    interp='위험자산 하방 압력 후보' if d=='RISK_OFF' else ('위험자산 상방 재료 후보' if d=='RISK_ON' else '방향은 가격·금리·달러 반응으로 재확인')
-    src=f" · {row.get('source')}" if row.get('source') else ''
-    return (f"🚨 【미국 주요 이벤트 결과 감지】\n{mark} {row.get('name')}\n"
-            f"{row.get('title','')}{src}\n→ {interp}\n"
-            f"→ BTC·WLD·KAIA 후속 움직임과 4시간 동안 자동 역매칭\n{row.get('link','')}\n"
-            "※ 기사 제목만으로 인과 확정하지 않음 · 자동주문 없음")
-
-
-def event_result_loop():
-    """발표 전후에는 90초 간격으로 결과 기사를 찾고, 가격 임계치와 무관하게 먼저 중요알람."""
-    while True:
-        try:
-            now=datetime.now(KST)
-            if CHAT_ID:
-                for raw,level,name,impact in SCHEDULED_MARKET_EVENTS:
-                    dt=_event_dt(raw); sec=(now-dt).total_seconds()
-                    if -EVENT_RESULT_WINDOW_BEFORE <= sec <= EVENT_RESULT_WINDOW_AFTER:
-                        base=f'{dt.isoformat()}:{name}'
-                        if base in EVENT_RESULT_SENT: continue
-                        rows=_event_result_candidates(name)
-                        if rows:
-                            row=_remember_event_result(dt,level,name,rows[0])
-                            EVENT_RESULT_SENT.add(base)
-                            send_long(event_result_text(row),CHAT_ID)
-        except Exception as e:
-            print('[EventResult] error',repr(e),flush=True)
-        time.sleep(EVENT_RESULT_INTERVAL)
-
-
 def event_radar_loop():
     global EVENT_RADAR_LAST_DAILY
     while True:
@@ -3307,7 +3306,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send("✅ Jaina Coin Monitor v17.4 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/positionset W 181196.28957743 486.5623 실제잔고정정\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/buyplan W 585 560 525 680 예약매수·돌파계획\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/lead WLD·KAIA 선행호재 레이다\n/agidiag AGI→WLD 뉴스수집 진단\n/radar 미국증시·코인 사전 이벤트 레이더\n/eventresult 최근 미국 주요 이벤트 결과\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send(f"✅ Jaina Coin Monitor v{BOT_VERSION} 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/buyplan W 585 560 525 680 예약매수·돌파계획\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/lead WLD·KAIA 선행호재 레이다\n/clarity CLARITY Act 전용 법안·표결 레이다\n/agidiag AGI→WLD 뉴스수집 진단\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/reversaltest 상승→재하락 전환 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
             elif text.split()[0].split("@")[0].lower() == "/agidiag" if text else False:
                 send("🧪 AGI→WLD 다중 뉴스소스를 백그라운드에서 진단합니다.", cid)
                 def _agidiag_worker(chat_id):
@@ -3319,6 +3318,8 @@ def telegram_loop():
                 threading.Thread(target=_agidiag_worker,args=(cid,),daemon=True).start()
             elif text.startswith("/lead"):
                 send_long(leading_catalyst_text(),cid)
+            elif text.startswith("/clarity"):
+                send_long(clarity_radar_text(),cid)
             elif text.startswith("/radar"):
                 send_long(event_radar_text(),cid)
             elif text.startswith("/sellqty"):
@@ -3417,21 +3418,6 @@ def telegram_loop():
                     )
                 except Exception as e:
                     send(f"⚠️ 인출 기록 실패: {e}",cid)
-            elif text.startswith("/positionset"):
-                try:
-                    p=text.split(maxsplit=4)
-                    if len(p)<4:
-                        raise ValueError("사용법: /positionset W 181196.28957743 486.5623 실제잔고정정")
-                    reason=p[4] if len(p)>4 else ""
-                    r=record_positionset(p[1],p[2],p[3],reason)
-                    short="W" if r["symbol"]=="WLD" else "K"
-                    send(
-                        f"✅ {short} 실제 포지션 정정 완료\n"
-                        f"정정 전 {qty_text(r['before_qty'])}개 / {r['before_avg']:,.4f}원\n"
-                        f"정정 후 {qty_text(r['qty'])}개 / {r['avg']:,.4f}원\n"
-                        f"※ 재매수 현금·실현손익 누계는 변경하지 않음", cid)
-                except Exception as e:
-                    send(f"⚠️ 포지션 정정 실패: {e}",cid)
             elif text.startswith("/position"):
                 send(position_text(),cid)
             elif text.split()[0].split("@")[0].lower() == "/trend" if text else False:
@@ -3457,6 +3443,8 @@ def telegram_loop():
                 run_enginetest(cid)
             elif text.startswith("/signaltest"):
                 run_signaltest(cid)
+            elif text.startswith("/reversaltest"):
+                run_reversaltest(cid)
             elif text.startswith("/autotest"):
                 send("🧪 17분 자동보고 기능을 즉시 테스트합니다.", cid)
                 send_summary_once(cid)
@@ -3481,10 +3469,6 @@ def telegram_loop():
             elif text.split()[0].split("@")[0].lower() == "/cause" if text else False:
                 send("🔎 현재 W·K/BTC 변동과 최신 시장 원인을 우선 분석합니다.",cid)
                 threading.Thread(target=cause_command_worker,args=(cid,),daemon=True).start()
-            elif text.split()[0].split("@")[0].lower() == "/eventresult" if text else False:
-                row=recent_event_context(None,6*3600)
-                if row: send_long(event_result_text(row),cid)
-                else: send("📡 최근 6시간 저장된 미국 주요 이벤트 결과 없음 — 발표시간에는 자동 감시합니다.",cid)
             elif text.startswith("/news"):
                 send("📰 최신 뉴스를 수집하고 있습니다. 잠시만 기다려 주세요.",cid)
                 try:
@@ -3824,7 +3808,7 @@ if callable(_v165_original_handle_update):
 threading.Thread(target=monitor_loop,daemon=True).start()
 threading.Thread(target=telegram_loop,daemon=True).start()
 threading.Thread(target=event_radar_loop,daemon=True).start()
-threading.Thread(target=event_result_loop,daemon=True).start()
+threading.Thread(target=clarity_radar_loop,daemon=True).start()
 threading.Thread(target=leading_catalyst_loop,daemon=True).start()
 threading.Thread(target=persistence_loop,daemon=True).start()
 threading.Thread(target=auto_news_loop,daemon=True).start()
