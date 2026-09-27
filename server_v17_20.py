@@ -5,7 +5,7 @@ CAUSE_ENGINE = "RSS-TIMEZONE-FIX-v9"
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from collections import deque
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import quote_plus, urljoin
 import xml.etree.ElementTree as ET
 from flask import Flask, jsonify, render_template_string
 import re
@@ -1027,10 +1027,10 @@ def alert_text(symbol,d):
 OFFICIAL_NEWS_LAST={}
 OFFICIAL_NEWS_LOCK=threading.RLock()
 OFFICIAL_NEWS_POLL=5*60
-OFFICIAL_NEWS_MAX_AGE_H=36.0
+OFFICIAL_NEWS_MAX_AGE_H=30*24.0
 OFFICIAL_NEWS_REPEAT_TTL=7*24*3600
 OFFICIAL_PROJECT_SOURCES={
- "WLD":[("World Blog","https://world.org/blog"),("World Announcements","https://world.org/blog/announcements"),("World Search KR","https://world.org/ko-kr/search")],
+ "WLD":[("World Official","https://world.org/"),("World Announcements","https://world.org/blog/announcements"),("World Search","https://world.org/ko-kr/search")],
  "KAIA":[("Kaia Official Blog","https://blog.kaia.io/"),
          ("Kaia Announcements","https://blog.kaia.io/tag/announcements/"),
          ("Kaia Media Center","https://www.kaia.io/media-center")],
@@ -1071,12 +1071,6 @@ def _official_date_from_html(body):
                 dt=parsedate_to_datetime(m.group(0))
                 if dt: return m.group(0)
             except Exception: pass
-    # v17.19: World Korean pages expose dates as 2026년 9월 17일.
-    m=re.search(r'\b(20\d{2})년\s*(\d{1,2})월\s*(\d{1,2})일\b',txt)
-    if m:
-        try:
-            return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}T00:00:00+09:00"
-        except Exception: pass
     return ""
 
 def _official_listing_rows(source,url,symbol,raw,limit=24):
@@ -1096,7 +1090,7 @@ def _official_listing_rows(source,url,symbol,raw,limit=24):
 def _official_extract_html(source,url,symbol,limit=12):
     rows=[]
     try:
-        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/17.20"},
+        r=SESSION.get(url,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/17.15"},
                       timeout=(3.0,7.0),allow_redirects=True); r.raise_for_status()
         raw=r.text or ""
         # v17.18: collect real article URLs first; do not depend only on title keywords.
@@ -1129,7 +1123,7 @@ def _official_extract_html(source,url,symbol,limit=12):
                 rows.append({"title":title,"link":href or url,"source":source,"pubdate":"",
                              "official":True,"project":symbol,"official_rank":0})
     except Exception as e:
-        NEWS_HEALTH["official_"+symbol+"_error"]=f"{type(e).__name__}: {str(e)[:120]}"
+        NEWS_HEALTH["official_"+symbol+"_error"]=type(e).__name__
     # v17.16: listing/home pages often expose article links without a date.
     # Follow a small number of candidate article links and read Article JSON-LD/meta
     # so fresh official announcements are not discarded as "timestamp unknown".
@@ -1139,7 +1133,7 @@ def _official_extract_html(source,url,symbol,limit=12):
         it["link"]=link
         if not str(it.get("pubdate") or "").strip() and link and link.rstrip("/") != url.rstrip("/"):
             try:
-                d=SESSION.get(link,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/17.20"},timeout=(2.5,5.5),allow_redirects=True)
+                d=SESSION.get(link,headers={"User-Agent":"Mozilla/5.0 JainaCoinMonitor/17.16"},timeout=(2.5,5.5),allow_redirects=True)
                 if d.ok:
                     body=d.text or ""
                     parsed_date=_official_date_from_html(body)
@@ -1193,7 +1187,7 @@ def _official_is_real_news(it):
     if link.rstrip("/") in tuple(x.rstrip("/") for x in bare): return False
     return True
 
-def _official_recent_rows(symbol,limit=8,max_age_h=36.0):
+def _official_recent_rows(symbol,limit=8,max_age_h=30*24.0):
     rows=[]
     for it in official_project_news(symbol,max(limit*2,12)):
         age=_news_age_hours(it)
@@ -1206,15 +1200,10 @@ def _official_recent_rows(symbol,limit=8,max_age_h=36.0):
 def official_news_text():
     parts=["🏢 【WLD·KAIA 공식뉴스 레이더 v17.20】",
            "우선순위: 프로젝트 공식 홈페이지/블로그 → 기존 주요언론/RSS",
-           "표시·자동알람: 게시시각 확인 가능한 36시간 이내 실제 신규 공식뉴스만"]
+           "표시: 최근 30일 실제 공식뉴스 · 자동알람: 새 게시물 중복차단"]
     for symbol in ("WLD","KAIA"):
-        parts.append("\n【"+symbol+"】"); rows=_official_recent_rows(symbol,8,36.0)
-        if not rows:
-            raw_n=int(safe_float(NEWS_HEALTH.get("official_"+symbol+"_rows")))
-            dated_n=int(safe_float(NEWS_HEALTH.get("official_"+symbol+"_dated")))
-            err=NEWS_HEALTH.get("official_"+symbol+"_error","")
-            diag=f" · 수집 {raw_n}건/시각확인 {dated_n}건" + (f"/오류 {err}" if err else "")
-            parts.append("• 최근 36시간 신규 공식뉴스 없음"+diag); continue
+        parts.append("\n【"+symbol+"】"); rows=_official_recent_rows(symbol,8,30*24.0)
+        if not rows: parts.append("• 최근 30일 신규 공식뉴스 미확인 (수집 실패 여부 별도 점검)"); continue
         for it in rows[:4]:
             age=_news_age_hours(it)
             age_txt=(f"{age:.1f}시간 전" if age<48 else f"{age/24:.1f}일 전") if age<9999 else "게시시각 미확인"
@@ -1503,9 +1492,9 @@ def _dedupe_news(items):
 def catalyst_search(symbol):
     if symbol=="WLD":
         positive_queries=[
-            '"Worldcoin" OR "World Network" partnership launch expansion adoption integration when:30d',
-            '"World Chain" OR "World ID" OR Orb launch integration adoption when:30d',
-            'WLD Worldcoin ecosystem developer grant funding listing when:30d',
+            '"Worldcoin" OR "World Network" partnership launch expansion adoption integration when:14d',
+            '"World Chain" OR "World ID" OR Orb launch integration adoption when:14d',
+            'WLD Worldcoin ecosystem developer grant funding listing when:14d',
             'OpenAI ChatGPT AGI artificial general intelligence breakthrough model launch release upgrade when:7d',
             'OpenAI ChatGPT AGI 에이전트 출시 업그레이드 인간 인증 디지털 신원 when:7d',
             'OpenAI ChatGPT AI agents autonomous agents human verification identity when:7d',
@@ -1521,9 +1510,9 @@ def catalyst_search(symbol):
         ]
     else:
         positive_queries=[
-            'KAIA blockchain partnership launch ecosystem adoption integration when:30d',
-            '"Kaia" stablecoin payment wallet mini dapp mainnet when:30d',
-            'KAIA developer grant funding listing ecosystem when:30d',
+            'KAIA blockchain partnership launch ecosystem adoption integration when:14d',
+            '"Kaia" stablecoin payment wallet mini dapp mainnet when:14d',
+            'KAIA developer grant funding listing ecosystem when:14d',
         ]
         risk_query='KAIA blockchain regulation delist hack outage token unlock when:30d'
         themes=[
@@ -1538,7 +1527,7 @@ def catalyst_search(symbol):
     # v17.16 official-first: official project posts feed the SAME catalyst radar,
     # instead of living in a separate /official silo.
     try:
-        positives += _official_recent_rows(symbol,8,48.0)
+        positives += _official_recent_rows(symbol,12,24.0*30)
     except Exception:
         pass
     for q in positive_queries:
@@ -1548,7 +1537,7 @@ def catalyst_search(symbol):
             pass
     # Extra exact-product query catches exchange/Bloomingbit coverage of launches.
     if symbol=="WLD":
-        try: positives += google_news_rss('"World Money" Worldcoin Stripe stablecoin launch when:3d',8)
+        try: positives += google_news_rss('"World Money" Worldcoin stablecoin launch when:14d',10)
         except Exception: pass
     positives=[x for x in _dedupe_news(positives) if _news_title_quality(x)]
     positives=sorted(positives, key=catalyst_score_item, reverse=True)
@@ -1640,7 +1629,7 @@ def good_radar_text():
                 src=f" · {it.get('source')}" if it.get("source") else ""
                 parts.append(f"{i}. {it['title']}{src}\n{it['link']}")
         else:
-            parts.append("최근 30일 뚜렷한 신규 호재 기사 부족")
+            parts.append("최근 30일 뚜렷한 신규 호재 미확인 — 수집 실패와 동일하게 취급하지 않음")
 
         parts.append("🔎 앞으로 볼 핵심")
         for x in r["themes"][:4]:
@@ -1667,6 +1656,8 @@ def good_radar_text():
     parts += [
         "",
         "※ 호재정보강도는 최근 기사·출처·키워드의 정보량 점수이며 가격 상승확률이 아닙니다.",
+        "※ v17.19: 공식 WLD/KAIA 발표는 30일 창으로 먼저 확인하고, 최근 14일 시장기사와 교차검증합니다.",
+        "※ 상승 중에는 과거 정책뉴스보다 프로젝트 직접재료·시장동조·거래량 원인을 우선합니다.",
         "※ 공식 발표/신뢰도 높은 매체를 우선하고 루머성 제목은 판단 근거에서 낮게 봅니다.",
         "※ 자동주문 없음 — 최종 매매는 코인원 앱에서 직접 판단"
     ]
@@ -3474,15 +3465,27 @@ def _clarity_focus(txt):
     return snippet[:500]
 
 def _clarity_official_rows():
+    """v17.20: official pages are indexes; extract only the local H.R.3633/CLARITY item, never the whole page."""
     out=[]
+    anchors=('h.r.3633','h.r. 3633','digital asset market clarity act','clarity act')
     for source,url in CLARITY_OFFICIAL_SOURCES:
         try:
-            r=SESSION.get(url,timeout=(3.0,8.0),headers={'User-Agent':'Mozilla/5.0 JainaCoinMonitor/17.8'})
+            r=SESSION.get(url,timeout=(3.0,8.0),headers={'User-Agent':'Mozilla/5.0 JainaCoinMonitor/17.20'})
             if r.status_code != 200: continue
-            txt=_clarity_clean_text(r.text); snippet=_clarity_focus(txt)
-            if not snippet: continue
-            stage,level=_clarity_stage(snippet) or ('NEWS','⚪')
-            out.append((stage,level,0.0,{'title':snippet,'source':source,'link':url,'official':True}))
+            # Preserve block boundaries before stripping HTML so unrelated Senate items cannot merge.
+            raw=re.sub(r'(?is)<script.*?</script>|<style.*?</style>',' ',r.text or '')
+            raw=re.sub(r'(?i)</?(?:li|tr|p|article|section|h[1-6]|div|br)[^>]*>','\n',raw)
+            lines=[]
+            for block in raw.split('\n'):
+                txt=_clarity_clean_text(block)
+                low=txt.lower()
+                if len(txt)<8 or not any(a in low for a in anchors): continue
+                # hard reject known unrelated bill/items even when a nearby page label leaked in
+                if any(x in low for x in ('s.4668','protect college sports act')): continue
+                txt=txt[:420]
+                st=_clarity_stage(txt)
+                if st: lines.append((st[0],st[1],0.0,{'title':txt,'source':source,'link':url,'official':True}))
+            out.extend(lines[:4])
         except Exception as e:
             print('[ClarityOfficial]',source,type(e).__name__,flush=True)
     return out
@@ -3526,7 +3529,7 @@ def clarity_radar_rows(limit=8):
     return rows[:limit]
 
 def clarity_radar_text():
-    parts=['🏛️ 【CLARITY Act 전용 레이더 v17.11】','H.R. 3633 · 미 상원 시장구조 법안 집중감시','공식 상원자료 → Reuters/주요언론 → 다중 RSS 교차확인']
+    parts=['🏛️ 【CLARITY Act 전용 레이더 v17.20】','H.R. 3633 · 미 상원 시장구조 법안 집중감시','공식 상원자료 → Reuters/주요언론 → 다중 RSS 교차확인']
     rows=clarity_radar_rows(8)
     # v17.11: /clarity가 확인한 RESULT를 즉시 공용 이벤트 캐시에 저장.
     # 이후 /cause는 Senate/RSS를 다시 조회하지 않고 이 캐시를 사용한다.
@@ -3556,6 +3559,16 @@ def clarity_radar_loop():
                 for stage,level,age,it in clarity_radar_rows(8):
                     title=(it.get('title') or '').strip(); key=f'{stage}:{re.sub(r"\\W+"," ",title.lower())[:180]}'
                     cooldown=CLARITY_COOLDOWN if stage in ('RESULT','CHANGE','UPDATE') else 3*3600
+                    # v17.19 stale-CLARITY guard: automatic alerts must be genuinely fresh.
+                    # Official index pages often have no article timestamp, so PREVIEW/NEWS from
+                    # those pages are manual-/clarity-only unless a fresh dated report confirms them.
+                    if stage in ('PREVIEW','NEWS'):
+                        if it.get('official'):
+                            continue
+                        if safe_float(age,999) > 12.0:
+                            continue
+                    elif stage in ('UPDATE','CHANGE') and (not it.get('official')) and safe_float(age,999) > 24.0:
+                        continue
                     if now-CLARITY_LAST.get(key,0) < cooldown: continue
                     CLARITY_LAST[key]=now
                     label={'RESULT':'표결 결과','CHANGE':'일정 변경','UPDATE':'법안 수정·협상','PREVIEW':'표결 사전예고','NEWS':'관련 뉴스'}.get(stage,stage)
