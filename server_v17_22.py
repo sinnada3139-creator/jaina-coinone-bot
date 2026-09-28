@@ -5,7 +5,7 @@ CAUSE_ENGINE = "RSS-TIMEZONE-FIX-v9"
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from collections import deque
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import quote_plus, urljoin
 import xml.etree.ElementTree as ET
 from flask import Flask, jsonify, render_template_string
 import re
@@ -1244,7 +1244,7 @@ def _official_recent_rows(symbol,limit=8,max_age_h=30*24.0):
     return rows[:limit]
 
 def official_news_text():
-    parts=["🏢 【WLD·KAIA 공식뉴스 레이더 v17.22】",
+    parts=["🏢 【WLD·KAIA 공식뉴스 레이더 v17.21】",
            "우선순위: 프로젝트 공식 홈페이지/블로그 → 기존 주요언론/RSS",
            "표시: 최근 30일 실제 공식뉴스 · 자동알람: 새 게시물 중복차단"]
     for symbol in ("WLD","KAIA"):
@@ -1440,6 +1440,10 @@ LAST_BREAKING_CHECK = 0.0
 BREAKING_CHECK_INTERVAL = 10 * 60   # 10분마다 새 중요 호재/악재 확인
 SEEN_BREAKING_KEYS = set()
 BREAKING_PRIMED = False
+# v17.22: W/K 개별뉴스와 별도로 글로벌 거시 이벤트를 즉시 감시한다.
+SEEN_MACRO_BREAKING_KEYS = set()
+MACRO_BREAKING_PRIMED = False
+MACRO_BREAKING_STARTUP_HOURS = 3.0
 
 POS_WORDS = [
     "partnership","partner","launch","upgrade","adoption","integration",
@@ -1520,22 +1524,6 @@ def _wld_ai_bridge_score(item):
     if source_weight(item.get('source')) >= 2: score += 1
     return score
 
-def _catalyst_freshness_bonus(item):
-    """v17.22: current-move radar strongly prefers fresh evidence over old high-keyword headlines."""
-    age=_news_age_hours(item)
-    if age <= 24: return 14
-    if age <= 72: return 10
-    if age <= 7*24: return 6
-    if age <= 14*24: return 2
-    if age <= 30*24: return -4
-    return -20
-
-def _catalyst_sort_key(item):
-    """Freshness is the first tie-breaker; official/high-quality score remains important."""
-    age=_news_age_hours(item)
-    bucket=0 if age<=24 else (1 if age<=72 else (2 if age<=7*24 else (3 if age<=14*24 else 4)))
-    return (bucket, -catalyst_score_item(item), age)
-
 def catalyst_score_item(item):
     if not _news_title_quality(item):
         return -99
@@ -1544,7 +1532,7 @@ def catalyst_score_item(item):
     risk=sum(1 for w in RISK_WORDS if w.lower() in text)
     bridge_bonus=_wld_ai_bridge_score(item)
     official_bonus=6 if item.get("official") else 0
-    fresh_bonus=_catalyst_freshness_bonus(item)
+    fresh_bonus=3 if item.get("official") and _news_age_hours(item)<=48 else 0
     return pos*2 + bridge_bonus + source_weight(item.get("source")) + official_bonus + fresh_bonus - risk*2
 
 def _dedupe_news(items):
@@ -1594,7 +1582,7 @@ def catalyst_search(symbol):
     # v17.16 official-first: official project posts feed the SAME catalyst radar,
     # instead of living in a separate /official silo.
     try:
-        positives += _official_recent_rows(symbol,12,24.0*14)
+        positives += _official_recent_rows(symbol,12,24.0*30)
     except Exception:
         pass
     for q in positive_queries:
@@ -1606,14 +1594,11 @@ def catalyst_search(symbol):
     if symbol=="WLD":
         try: positives += google_news_rss('"World Money" Worldcoin stablecoin launch when:14d',10)
         except Exception: pass
-    positives=[x for x in _dedupe_news(positives)
-               if _news_title_quality(x) and _parse_pub_ts(x.get("pubdate")) and _news_age_hours(x)<=14*24]
-    positives=sorted(positives, key=_catalyst_sort_key)
+    positives=[x for x in _dedupe_news(positives) if _news_title_quality(x)]
+    positives=sorted(positives, key=catalyst_score_item, reverse=True)
 
     try:
-        risks=[x for x in _dedupe_news(google_news_rss(risk_query, 5))
-               if _news_title_quality(x) and _parse_pub_ts(x.get("pubdate")) and _news_age_hours(x)<=30*24]
-        risks=sorted(risks,key=lambda x:_news_age_hours(x))
+        risks=[x for x in _dedupe_news(google_news_rss(risk_query, 5)) if _news_title_quality(x)]
     except Exception:
         risks=[]
 
@@ -1647,10 +1632,9 @@ def breaking_candidates():
     for symbol in ("WLD","KAIA"):
         r=catalyst_search(symbol)
         for it in r.get("positive",[]):
-            sc=catalyst_score_item(it); age=_news_age_hours(it)
-            # v17.22: 즉시알람은 현재 움직임과 연결 가능한 신선한 근거만 허용.
-            fresh_enough = age<=72 or (it.get("official") and age<=7*24)
-            if sc>=5 and fresh_enough:
+            sc=catalyst_score_item(it)
+            # 파트너십/출시/채택/상장 등 키워드가 복수로 잡히거나 신뢰도 높은 출처인 경우
+            if sc>=5:
                 out.append(("positive",symbol,sc,it))
         for it in r.get("risks",[]):
             title=(it.get("title") or "").lower()
@@ -1658,6 +1642,45 @@ def breaking_candidates():
             if risk_hits>=1:
                 out.append(("risk",symbol,-max(4,risk_hits*2),it))
     return out
+
+def macro_breaking_candidates():
+    """v17.22 글로벌 시장 이벤트 후보. WLD/KAIA 직접 관련성이 없어도 시장 충격이면 잡는다."""
+    try:
+        items=_macro_news("DOWN")
+    except Exception as e:
+        print("[MacroBreaking] collect error", type(e).__name__, flush=True)
+        return []
+    out=[]
+    important={"연준·금리","달러·국채금리","미국 물가·고용","ETF 자금","레버리지·옵션","규제·법률","해킹·보안","에너지·유가","지정학·전쟁","관세"}
+    shock=("rate hike","hawkish","war ","conflict","strike","missile","attack","iran","israel","hormuz","oil","crude","brent","wti","yield","liquidat","outflow","ban","hack","급락","금리 인상","매파","전쟁","공습","미사일","공격","이란","이스라엘","호르무즈","유가","원유","국채금리","청산","유출","해킹")
+    for it in _dedupe_news(items):
+        age=_news_age_hours(it)
+        if age>30: continue
+        title=it.get("title","")
+        cat=_macro_category(title)
+        if cat not in important or _category_support_score(title,cat)<=0: continue
+        low=title.lower()
+        strength=sum(1 for w in shock if w in low)
+        # 신뢰 가능한 최신 거시 기사 또는 충격 키워드 2개 이상이면 즉시 후보.
+        trust=source_weight(it.get("source"))
+        if strength>=2 or (strength>=1 and trust>=2):
+            out.append((cat, strength + trust, it))
+    out.sort(key=lambda x:(-_news_age_hours(x[2]), x[1]), reverse=True)
+    return out[:12]
+
+
+def macro_breaking_text(rows):
+    parts=["🚨 【글로벌 시장 이벤트 즉시알람】"]
+    cats=[]
+    for cat,score,it in rows[:5]:
+        if cat not in cats: cats.append(cat)
+        src=f" · {it.get('source')}" if it.get("source") else ""
+        parts.append(f"\n⚠️ {cat}\n{it.get('title','')}{src}\n{it.get('link','')}")
+    if cats:
+        parts.append("\n🔗 감지 경로: " + " → ".join(cats))
+    parts.append("\n※ WLD/KAIA 개별뉴스가 없어도 연준·금리·유가·전쟁·청산 등 시장 전체 충격은 독립 감시합니다. 자동주문 없음.")
+    return "\n".join(parts)
+
 
 def breaking_check_text(new_items):
     if not new_items:
@@ -1698,10 +1721,7 @@ def good_radar_text():
         if r["positive"]:
             for i,it in enumerate(r["positive"][:4],1):
                 src=f" · {it.get('source')}" if it.get("source") else ""
-                age=_news_age_hours(it)
-                age_txt=(f"{age:.1f}시간 전" if age<48 else f"{age/24:.1f}일 전")
-                official_tag=" · 🏢공식" if it.get("official") else ""
-                parts.append(f"{i}. [{age_txt}{official_tag}] {it['title']}{src}\n{it['link']}")
+                parts.append(f"{i}. {it['title']}{src}\n{it['link']}")
         else:
             parts.append("최근 30일 뚜렷한 신규 호재 미확인 — 수집 실패와 동일하게 취급하지 않음")
 
@@ -1730,8 +1750,7 @@ def good_radar_text():
     parts += [
         "",
         "※ 호재정보강도는 최근 기사·출처·키워드의 정보량 점수이며 가격 상승확률이 아닙니다.",
-        "※ v17.22: /official은 30일 공식기록을 보여주되 /good·즉시알람은 최근 24h→72h→7d→14d 순으로 강제 우선합니다.",
-        "※ 게시시각을 검증할 수 없는 뉴스는 현재 상승 원인 후보에서 제외합니다.",
+        "※ v17.21: /official·/good·/lead가 같은 30일 공식뉴스 캐시를 공유하고, 최근 14일 시장기사와 교차검증합니다.",
         "※ 상승 중에는 과거 정책뉴스보다 프로젝트 직접재료·시장동조·거래량 원인을 우선합니다.",
         "※ 공식 발표/신뢰도 높은 매체를 우선하고 루머성 제목은 판단 근거에서 낮게 봅니다.",
         "※ 자동주문 없음 — 최종 매매는 코인원 앱에서 직접 판단"
@@ -3221,7 +3240,7 @@ def news_digest(symbol_filter=None):
     return '\n'.join(parts)
 
 def auto_news_loop():
-    global LAST_NEWS_SENT, LAST_BREAKING_CHECK, BREAKING_PRIMED, SEEN_BREAKING_KEYS
+    global LAST_NEWS_SENT, LAST_BREAKING_CHECK, BREAKING_PRIMED, SEEN_BREAKING_KEYS, MACRO_BREAKING_PRIMED, SEEN_MACRO_BREAKING_KEYS
     while True:
         try:
             now=time.time()
@@ -3235,6 +3254,24 @@ def auto_news_loop():
 
             # 10분마다 새 중요 호재/악재 확인. 시작 직후 기존 기사들은 기준선으로만 등록.
             if CHAT_ID and now - LAST_BREAKING_CHECK >= BREAKING_CHECK_INTERVAL and not NEWS_PRIORITY.is_set():
+                # v17.22 글로벌 거시 이벤트를 먼저 확인. 프로젝트 뉴스 필터와 완전히 분리한다.
+                macro_rows=macro_breaking_candidates()
+                macro_fresh=[]
+                for row in macro_rows:
+                    k=news_key(row[2])
+                    if not k: continue
+                    age=_news_age_hours(row[2])
+                    # 재시작 직후에도 3시간 이내 S급 이벤트는 버리지 않고 1회 알림한다.
+                    if k not in SEEN_MACRO_BREAKING_KEYS and (MACRO_BREAKING_PRIMED or age<=MACRO_BREAKING_STARTUP_HOURS):
+                        macro_fresh.append(row)
+                    SEEN_MACRO_BREAKING_KEYS.add(k)
+                MACRO_BREAKING_PRIMED=True
+                if macro_fresh:
+                    send_long(macro_breaking_text(macro_fresh), CHAT_ID)
+                    print("[MacroBreaking] global event alert sent", len(macro_fresh), flush=True)
+                if len(SEEN_MACRO_BREAKING_KEYS)>800:
+                    SEEN_MACRO_BREAKING_KEYS=set(list(SEEN_MACRO_BREAKING_KEYS)[-500:])
+
                 candidates=breaking_candidates()
                 keys={news_key(it) for _,_,_,it in candidates if news_key(it)}
                 if not BREAKING_PRIMED:
@@ -3846,7 +3883,7 @@ def telegram_loop():
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
             if text.startswith("/start") or text.lower()=="start":
-                send(f"✅ Jaina Coin Monitor v{BOT_VERSION} 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/buyplan W 585 560 525 680 예약매수·돌파계획\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/official 공식뉴스 우선 레이더\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/lead WLD·KAIA 선행호재 레이다\n/clarity CLARITY Act 전용 법안·표결 레이다\n/agidiag AGI→WLD 뉴스수집 진단\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/reversaltest 상승→재하락 전환 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+                send(f"✅ Jaina Coin Monitor v{BOT_VERSION} 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/buyplan W 585 560 525 680 예약매수·돌파계획\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/official 공식뉴스 우선 레이더\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/lead WLD·KAIA 선행호재 레이다\n/clarity CLARITY Act 전용 법안·표결 레이다\n/agidiag AGI→WLD 뉴스수집 진단\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/reversaltest 상승→재하락 전환 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n🌍 연준·금리·유가·전쟁 글로벌 이벤트 즉시알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
             elif text.split()[0].split("@")[0].lower() == "/agidiag" if text else False:
                 send("🧪 AGI→WLD 다중 뉴스소스를 백그라운드에서 진단합니다.", cid)
                 def _agidiag_worker(chat_id):
