@@ -1,6 +1,6 @@
 import os, time, threading, requests, json, html
 
-BOT_VERSION = "17.23"
+BOT_VERSION = "17.24"
 CAUSE_ENGINE = "RSS-TIMEZONE-FIX-v9"
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -9,6 +9,7 @@ from urllib.parse import quote_plus, urljoin
 import xml.etree.ElementTree as ET
 from flask import Flask, jsonify, render_template_string
 import re
+import math
 
 app = Flask(__name__)
 COINS = {"WLD":{"avg":554.9481,"qty":182164.27342226},"KAIA":{"avg":35.1224,"qty":943107.03207647}}
@@ -17,6 +18,7 @@ SESSION = requests.Session()
 NEWS_HEALTH = {"last_errors":0, "last_ok":0, "last_ts":0.0, "circuit_until":0.0}
 NEWS_CACHE = {}
 NEWS_CACHE_LOCK = threading.RLock()
+STATE_SAVE_LOCK = threading.RLock()
 NEWS_PRIORITY = threading.Event()
 NEWS_CACHE_TTL = 6 * 3600
 NEWS_STALE_TTL = 48 * 3600
@@ -32,6 +34,7 @@ SUMMARY_HEALTH = {"last_attempt":0.0, "last_success":0.0, "next_due":0.0, "threa
 SUMMARY_THREAD_LOCK = threading.Lock()
 LOCK = threading.RLock()
 SYMBOL_ALIAS = {"W":"WLD","K":"KAIA","WLD":"WLD","KAIA":"KAIA"}
+EXACT_FILL_IDS = set()
 LEDGER = {s:{
     "qty":float(COINS[s]["qty"]), "avg":float(COINS[s]["avg"]),
     "cash":0.0, "withdrawn":0.0, "deposited":0.0, "realized_pnl":0.0, "trades":[]
@@ -67,6 +70,7 @@ def load_persistent_state():
         saved_chat = str(saved.get("_chat_id", "") or "")
         if saved_chat:
             CHAT_ID = saved_chat
+        EXACT_FILL_IDS.update(str(x) for x in saved.get("_exact_fill_ids", []))
         saved_ledger = saved.get("_ledger", {}) or {}
         saved_buy_plan = saved.get("_buy_plan", {}) or {}
         for symbol in COINS:
@@ -123,63 +127,65 @@ def load_persistent_state():
         print("[State] load error", e, flush=True)
 
 def save_persistent_state():
-    try:
-        directory = os.path.dirname(STATE_FILE)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        with LOCK:
-            data = {"_chat_id": CHAT_ID, "_position_revision": POSITION_REVISION_LOADED}
-            data["_ledger"] = {s:{
-                "qty":float(LEDGER[s]["qty"]), "avg":float(LEDGER[s]["avg"]),
-                "cash":float(LEDGER[s]["cash"]),
-                "withdrawn":float(LEDGER[s].get("withdrawn",0.0)),
-                "deposited":float(LEDGER[s].get("deposited",0.0)),
-                "realized_pnl":float(LEDGER[s]["realized_pnl"]),
-                "trades":list(LEDGER[s]["trades"])[-100:]
-            } for s in COINS}
-            data["_buy_plan"] = {s:{
-                "levels":list(BUY_PLAN[s].get("levels", []))[:3],
-                "breakout":float(BUY_PLAN[s].get("breakout", 0.0) or 0.0),
-                "last_price":float(BUY_PLAN[s].get("last_price", 0.0) or 0.0),
-                "level_armed":list(BUY_PLAN[s].get("level_armed", [True,True,True]))[:3],
-                "breakout_armed":bool(BUY_PLAN[s].get("breakout_armed", True)),
-                "last_alert_ts":float(BUY_PLAN[s].get("last_alert_ts", 0.0) or 0.0),
-            } for s in COINS}
-            for symbol in COINS:
-                st = STATE[symbol]
-                data[symbol] = {
-                    "peak": float(st.get("peak", 0.0) or 0.0),
-                    "peak_profit_krw": float(st.get("peak_profit_krw", 0.0) or 0.0),
-                    "last_signal": str(st.get("last_signal", "") or ""),
-                    "last_alert_ts": float(st.get("last_alert_ts", 0.0) or 0.0),
-                    "saved_at": int(time.time()),
-                }
+    with LOCK, STATE_SAVE_LOCK:
+        try:
+            directory = os.path.dirname(STATE_FILE)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with LOCK:
+                data = {"_chat_id": CHAT_ID, "_position_revision": POSITION_REVISION_LOADED}
+                data["_exact_fill_ids"] = sorted(EXACT_FILL_IDS)
+                data["_ledger"] = {s:{
+                    "qty":float(LEDGER[s]["qty"]), "avg":float(LEDGER[s]["avg"]),
+                    "cash":float(LEDGER[s]["cash"]),
+                    "withdrawn":float(LEDGER[s].get("withdrawn",0.0)),
+                    "deposited":float(LEDGER[s].get("deposited",0.0)),
+                    "realized_pnl":float(LEDGER[s]["realized_pnl"]),
+                    "trades":list(LEDGER[s]["trades"])[-100:]
+                } for s in COINS}
+                data["_buy_plan"] = {s:{
+                    "levels":list(BUY_PLAN[s].get("levels", []))[:3],
+                    "breakout":float(BUY_PLAN[s].get("breakout", 0.0) or 0.0),
+                    "last_price":float(BUY_PLAN[s].get("last_price", 0.0) or 0.0),
+                    "level_armed":list(BUY_PLAN[s].get("level_armed", [True,True,True]))[:3],
+                    "breakout_armed":bool(BUY_PLAN[s].get("breakout_armed", True)),
+                    "last_alert_ts":float(BUY_PLAN[s].get("last_alert_ts", 0.0) or 0.0),
+                } for s in COINS}
+                for symbol in COINS:
+                    st = STATE[symbol]
+                    data[symbol] = {
+                        "peak": float(st.get("peak", 0.0) or 0.0),
+                        "peak_profit_krw": float(st.get("peak_profit_krw", 0.0) or 0.0),
+                        "last_signal": str(st.get("last_signal", "") or ""),
+                        "last_alert_ts": float(st.get("last_alert_ts", 0.0) or 0.0),
+                        "saved_at": int(time.time()),
+                    }
 
-        # v13.4: persist only recent successful news entries.
-        # Snapshot outside the trading LOCK to avoid coupling market state and news I/O.
-        with NEWS_CACHE_LOCK:
-            now_ts = time.time()
-            news_snapshot = {}
-            for key, row in NEWS_CACHE.items():
-                try:
-                    ts = float((row or {}).get("ts", 0) or 0)
-                    items = list((row or {}).get("items", []) or [])[:12]
-                    if ts > 0 and (now_ts - ts) <= NEWS_STALE_TTL and items:
-                        news_snapshot[str(key)] = {"ts": ts, "items": items}
-                except Exception:
-                    continue
-            # Bound disk size.
-            if len(news_snapshot) > 120:
-                newest = sorted(news_snapshot.items(), key=lambda kv: kv[1].get("ts", 0), reverse=True)[:120]
-                news_snapshot = dict(newest)
-        data["_news_cache"] = news_snapshot
+            # v13.4: persist only recent successful news entries.
+            # Snapshot outside the trading LOCK to avoid coupling market state and news I/O.
+            with NEWS_CACHE_LOCK:
+                now_ts = time.time()
+                news_snapshot = {}
+                for key, row in NEWS_CACHE.items():
+                    try:
+                        ts = float((row or {}).get("ts", 0) or 0)
+                        items = list((row or {}).get("items", []) or [])[:12]
+                        if ts > 0 and (now_ts - ts) <= NEWS_STALE_TTL and items:
+                            news_snapshot[str(key)] = {"ts": ts, "items": items}
+                    except Exception:
+                        continue
+                # Bound disk size.
+                if len(news_snapshot) > 120:
+                    newest = sorted(news_snapshot.items(), key=lambda kv: kv[1].get("ts", 0), reverse=True)[:120]
+                    news_snapshot = dict(newest)
+            data["_news_cache"] = news_snapshot
 
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, STATE_FILE)
-    except Exception as e:
-        print("[State] save error", e, flush=True)
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, STATE_FILE)
+        except Exception as e:
+            print("[State] save error", e, flush=True)
 
 def persistence_loop():
     while True:
@@ -255,7 +261,7 @@ MARKET_CAUSE_COOLDOWN = 30 * 60
 def safe_float(v, default=0.0):
     try:
         x=float(v)
-        if x != x:  # NaN guard
+        if not math.isfinite(x):  # Reject NaN and infinity
             return default
         return x
     except:
@@ -295,7 +301,7 @@ def normalize_symbol(v):
     return SYMBOL_ALIAS.get(str(v or "").strip().upper())
 
 def qty_text(v):
-    return f"{float(v):,.4f}".rstrip("0").rstrip(".")
+    return f"{float(v):,.8f}".rstrip("0").rstrip(".")
 
 def record_sell(symbol, percent, price, reason=""):
     symbol=normalize_symbol(symbol); percent=safe_float(percent); price=safe_float(price)
@@ -403,7 +409,12 @@ def record_withdraw(symbol, amount, reason=""):
 def record_cashset(symbol, amount, reason=""):
     """재매수 가능 현금만 실제 거래소 잔액에 맞춰 정정한다. 인출/입금/실현손익 누계는 건드리지 않는다."""
     symbol=normalize_symbol(symbol)
-    amount=safe_float(amount)
+    try:
+        amount=float(amount)
+    except (TypeError, ValueError):
+        raise ValueError("현금 잔액은 숫자로 입력하세요.")
+    if not math.isfinite(amount):
+        raise ValueError("현금 잔액은 유한한 숫자로 입력하세요.")
     if not symbol:
         raise ValueError("코인은 W 또는 K로 입력하세요.")
     if amount < 0:
@@ -419,6 +430,74 @@ def record_cashset(symbol, amount, reason=""):
         save_persistent_state()
         return {"symbol":symbol,"before":before,"cash":amount,"reason":reason or ""}
 
+def record_exact_fill(symbol, side, qty, price, amount, fee, fill_id):
+    """Record a new exchange fill once; historical reconciled fills must not be replayed."""
+    symbol = normalize_symbol(symbol)
+    side = str(side).upper()
+    if not symbol or side not in ("BUY", "SELL"):
+        raise ValueError("코인 W/K, 구분 BUY/SELL을 확인하세요.")
+    values = [float(x) for x in (qty, price, amount, fee)]
+    qty, price, amount, fee = values
+    if not all(math.isfinite(x) for x in values) or min(qty, price, amount) <= 0 or fee < 0:
+        raise ValueError("수량·가격·금액은 양수, 수수료는 0 이상이어야 합니다.")
+    fill_id = str(fill_id).strip()
+    if not fill_id or len(fill_id) > 160:
+        raise ValueError("거래소 체결ID를 입력하세요(160자 이하).")
+    key = symbol + ":" + fill_id
+    with LOCK:
+        if key in EXACT_FILL_IDS:
+            raise ValueError("이미 기록한 체결ID입니다. 중복 반영하지 않았습니다.")
+        l = LEDGER[symbol]
+        if side == "SELL":
+            if qty > l["qty"] + 1e-8 or fee > amount:
+                raise ValueError("매도수량 또는 수수료를 확인하세요.")
+            l["qty"] = max(0.0, l["qty"] - qty)
+            l["cash"] += amount - fee
+            l["realized_pnl"] += amount - fee - l["avg"] * qty
+        else:
+            if amount + fee > l["cash"] + 1e-6:
+                raise ValueError("수수료 포함 매수대금보다 장부 현금이 부족합니다.")
+            new_qty = l["qty"] + qty
+            # Keep price basis separate from cash fees, as legacy ledger does.
+            l["avg"] = (l["qty"] * l["avg"] + amount) / new_qty
+            l["qty"] = new_qty
+            l["cash"] -= amount + fee
+        l["trades"].append({"ts":int(time.time()), "side":side + "_EXACT",
+                            "qty":qty, "price":price, "amount":amount, "fee":fee,
+                            "fill_id":fill_id, "reason":"거래소 체결값 직접 기록"})
+        l["trades"] = l["trades"][-100:]
+        EXACT_FILL_IDS.add(key)
+        COINS[symbol].update(qty=l["qty"], avg=l["avg"])
+        reset_position_alert_basis(symbol)
+        save_persistent_state()
+        return symbol
+
+
+def reset_position_alert_basis(symbol):
+    STATE[symbol]["peak_profit_krw"] = 0.0
+    STATE[symbol]["profit_drawdown_pct"] = 0.0
+    STATE[symbol]["last_signal"] = ""
+    STATE[symbol]["last_alert_ts"] = 0.0
+
+
+def record_position_set(symbol, qty, avg):
+    symbol = normalize_symbol(symbol)
+    qty, avg = float(qty), float(avg)
+    if not symbol or not math.isfinite(qty) or not math.isfinite(avg) or qty < 0 or avg <= 0:
+        raise ValueError("코인·현재 보유수량·평단을 확인하세요.")
+    with LOCK:
+        l = LEDGER[symbol]
+        l["trades"].append({"ts":int(time.time()),"side":"POSITION_SET",
+                            "before_qty":l["qty"],"before_avg":l["avg"],
+                            "qty":qty,"price":avg,"reason":"현재 거래소 잔고 직접 대조"})
+        l["trades"] = l["trades"][-100:]
+        l.update(qty=qty, avg=avg)
+        COINS[symbol].update(qty=qty, avg=avg)
+        reset_position_alert_basis(symbol)
+        save_persistent_state()
+        return symbol
+
+
 def position_text():
     lines=["📒 【자이나 매매장부】"]
     with LOCK:
@@ -430,7 +509,9 @@ def position_text():
                       f"외부입금 누적 {float(l.get('deposited',0.0)):,.0f}원",
                       f"개인인출 누적 {float(l.get('withdrawn',0.0)):,.0f}원",
                       f"누적 실현손익 {l['realized_pnl']:+,.0f}원"]
-    lines.append("\n※ 수수료 제외 · 사용자가 입력한 실제 체결만 반영")
+    lines.append("\n※ /fill 기록은 수수료 포함, 기존 /buy·/sell 기록은 수수료 제외")
+    lines.append("※ 원화는 종목별 배정 현금입니다. 거래소 전체 잔액을 W/K 양쪽에 중복 입력하지 마세요.")
+    lines.append("※ 약 1천만원 과거 출금: 정확한 금액·기존 반영 여부 확인 전 자동 차감 없음")
     return "\n".join(lines)
 
 
@@ -470,7 +551,7 @@ def booktest_text():
         } for k,v in LEDGER.items()}
     unchanged=(originals==after)
     lines += ["", ("✅ 4. 실제 장부 무변경 확인 통과" if unchanged else "❌ 4. 실제 장부 변경 감지"),
-              "", ("🎉 /booktest 전체 통과 — 실제 운영 가능" if unchanged else "⚠️ 운영 중지 — 장부 변경 여부 확인 필요")]
+              "", ("🎉 /booktest 가상 계산·장부 무변경 확인 통과" if unchanged else "⚠️ 운영 중지 — 장부 변경 여부 확인 필요")]
     return "\n".join(lines)
 
 # v12.1 trend filter: Coinone public candle data only (no account API / no auto-order)
@@ -920,6 +1001,8 @@ def strategy(symbol, tick):
 
 def set_buy_plan(symbol, level1, level2, level3, breakout):
     symbol = normalize_symbol(symbol)
+    if not symbol:
+        raise ValueError("코인은 W 또는 K로 입력하세요.")
     vals = [safe_float(level1), safe_float(level2), safe_float(level3)]
     bo = safe_float(breakout)
     if any(v <= 0 for v in vals) or bo <= 0:
@@ -3913,6 +3996,7 @@ def telegram_loop():
             msg=u.get("message") or {}
             cid=str((msg.get("chat") or {}).get("id") or "")
             text=(msg.get("text") or "").strip()
+            command = text.split()[0].split("@")[0].lower() if text else ""
             if not cid:
                 continue
             if cid and CHAT_ID != cid:
@@ -3920,9 +4004,9 @@ def telegram_loop():
                 save_persistent_state()
                 print("[Telegram] CHAT_ID registered:", cid, flush=True)
 
-            if text.startswith("/start") or text.lower()=="start":
-                send(f"✅ Jaina Coin Monitor v{BOT_VERSION} 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/buyplan W 585 560 525 680 예약매수·돌파계획\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/official 공식뉴스 우선 레이더\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/lead WLD·KAIA 선행호재 레이다\n/clarity CLARITY Act 전용 법안·표결 레이다\n/agidiag AGI→WLD 뉴스수집 진단\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/reversaltest 상승→재하락 전환 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n🌍 연준·금리·유가·전쟁 글로벌 이벤트 즉시알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
-            elif text.split()[0].split("@")[0].lower() == "/agidiag" if text else False:
+            if command == "/start" or text.lower()=="start":
+                send(f"✅ Jaina Coin Monitor v{BOT_VERSION} 연결 완료\n/status 현재상태\n/trend 단기·중기 상승추세 판단\n/position 매매장부 확인\n/positionset W 현재수량 현재평단\n/fill W BUY 수량 가격 금액 수수료 체결ID\n/sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결\n/buy W 3000000 520 재매수\n/buyplan W 585 560 525 680 예약매수·돌파계획\n/cashset W 0 잔액정정\n/news 최신 뉴스\n/official 공식뉴스 우선 레이더\n/good W·K 호재·전망 레이더\n/cause 현재 급변 원인 레이더\n/lead WLD·KAIA 선행호재 레이다\n/clarity CLARITY Act 전용 법안·표결 레이다\n/agidiag AGI→WLD 뉴스수집 진단\n/radar 미국증시·코인 사전 이벤트 레이더\n/market BTC 시장요약\n/test 알림테스트\n/signaltest 중요신호 테스트\n/reversaltest 상승→재하락 전환 테스트\n/enginetest 판단엔진 테스트\n/booktest 장부 안전 테스트\n\n⏰ 17분 자동 상태보고\n📰 뉴스·호재·전망 3시간 자동발송\n📡 매일 사전 이벤트 레이더 + 24시간/3시간 임박알림\n🌍 연준·금리·유가·전쟁 글로벌 이벤트 즉시알림\n⚡ W/K 급변 + BTC 선행충격 원인분석 즉시 알림\n※ 자동주문 없음",cid)
+            elif command == "/agidiag":
                 send("🧪 AGI→WLD 다중 뉴스소스를 백그라운드에서 진단합니다.", cid)
                 def _agidiag_worker(chat_id):
                     try:
@@ -3931,15 +4015,15 @@ def telegram_loop():
                         print("[Telegram] /agidiag error", repr(e), flush=True)
                         send(f"⚠️ AGI 뉴스 진단 오류: {type(e).__name__}: {e}", chat_id)
                 threading.Thread(target=_agidiag_worker,args=(cid,),daemon=True).start()
-            elif text.startswith("/lead"):
+            elif command == "/lead":
                 send_long(leading_catalyst_text(),cid)
-            elif text.split()[0].split("@")[0].lower() in ("/official","/officialnews","/공식뉴스") if text else False:
+            elif command in ("/official","/officialnews","/공식뉴스"):
                 official_command_async(cid)
-            elif text.startswith("/clarity"):
+            elif command == "/clarity":
                 send_long(clarity_radar_text(),cid)
-            elif text.startswith("/radar"):
+            elif command == "/radar":
                 send_long(event_radar_text(),cid)
-            elif text.startswith("/sellqty"):
+            elif command == "/sellqty":
                 try:
                     p=text.split(maxsplit=4)
                     if len(p)<4:
@@ -3960,7 +4044,7 @@ def telegram_loop():
                     )
                 except Exception as e:
                     send(f"⚠️ 실제수량 매도 기록 실패: {e}",cid)
-            elif text.startswith("/sell"):
+            elif command == "/sell":
                 try:
                     p=text.split(maxsplit=4)
                     if len(p)<4: raise ValueError("사용법: /sell W 15 559 급등익절\n/sellqty W 12173.91304347 552 실제체결")
@@ -3969,7 +4053,7 @@ def telegram_loop():
                     short="W" if s=="WLD" else "K"
                     send(f"✅ {short} 매도 기록 완료\n매도수량 {qty_text(q)}개\n확보금액 {amount:,.0f}원\n이번 실현손익 {pnl:+,.0f}원\n남은수량 {qty_text(remain)}개\n재매수 가능 현금 {cash:,.0f}원",cid)
                 except Exception as e: send(f"⚠️ 매도 기록 실패: {e}",cid)
-            elif text.split()[0].split("@")[0].lower() == "/buyplan" if text else False:
+            elif command == "/buyplan":
                 try:
                     p=text.split()
                     if len(p)==2:
@@ -3981,7 +4065,7 @@ def telegram_loop():
                         raise ValueError("사용법: /buyplan W 585 560 525 680\n조회: /buyplan W")
                 except Exception as e:
                     send(f"⚠️ 매수계획 설정 실패: {e}", cid)
-            elif text.startswith("/buy"):
+            elif command == "/buy":
                 try:
                     p=text.split(maxsplit=4)
                     if len(p)<4: raise ValueError("사용법: /buy W 3000000 520 재매수")
@@ -3990,16 +4074,16 @@ def telegram_loop():
                     short="W" if s=="WLD" else "K"
                     send(f"✅ {short} 재매수 기록 완료\n매수수량 {qty_text(q)}개\n새 보유수량 {qty_text(nq)}개\n새 장부평단 {na:,.4f}원\n남은 재매수 현금 {cash:,.0f}원",cid)
                 except Exception as e: send(f"⚠️ 재매수 기록 실패: {e}",cid)
-            elif text.startswith("/deposit"):
+            elif command == "/deposit":
                 try:
                     p=text.split(maxsplit=3)
                     if len(p)<3: raise ValueError("사용법: /deposit W 3000000 추가투자금")
                     reason=p[3] if len(p)>3 else ""
                     s,amount,cash,deposited=record_deposit(p[1],p[2],reason)
                     short="W" if s=="WLD" else "K"
-                    send(f"✅ {short} 외부입금 기록 완료\\n입금금액 {amount:,.0f}원\\n재매수 가능 현금 {cash:,.0f}원\\n외부입금 누적 {deposited:,.0f}원",cid)
+                    send(f"✅ {short} 외부입금 기록 완료\n입금금액 {amount:,.0f}원\n재매수 가능 현금 {cash:,.0f}원\n외부입금 누적 {deposited:,.0f}원",cid)
                 except Exception as e: send(f"⚠️ 입금 기록 실패: {e}",cid)
-            elif text.startswith("/cashset"):
+            elif command == "/cashset":
                 try:
                     p=text.split(maxsplit=3)
                     if len(p)<3:
@@ -4017,7 +4101,7 @@ def telegram_loop():
                     )
                 except Exception as e:
                     send(f"⚠️ 현금 잔액 정정 실패: {e}",cid)
-            elif text.startswith("/withdraw"):
+            elif command == "/withdraw":
                 try:
                     p=text.split(maxsplit=3)
                     if len(p)<3:
@@ -4035,18 +4119,36 @@ def telegram_loop():
                     )
                 except Exception as e:
                     send(f"⚠️ 인출 기록 실패: {e}",cid)
-            elif text.startswith("/position"):
+            elif command == "/fill":
+                try:
+                    p = text.split()
+                    if len(p) != 8:
+                        raise ValueError("사용법: /fill W BUY 수량 가격 체결금액 수수료 체결ID\n현재 장부에 아직 반영되지 않은 신규 체결만 입력하세요.")
+                    symbol = record_exact_fill(*p[1:])
+                    send("✅ 수수료 포함 실제체결 기록 완료\n" + position_text(), cid)
+                except Exception as e:
+                    send(f"⚠️ 체결 기록 실패: {e}", cid)
+            elif command == "/positionset":
+                try:
+                    p = text.split()
+                    if len(p) != 4:
+                        raise ValueError("사용법: /positionset W 현재보유수량 현재평단\n현금·출금·실현손익은 별도로 대조합니다.")
+                    record_position_set(*p[1:])
+                    send("✅ 현재 보유수량·평단 및 수익보호 기준 수정 완료\n" + position_text(), cid)
+                except Exception as e:
+                    send(f"⚠️ 보유자산 대조 실패: {e}", cid)
+            elif command == "/position":
                 send(position_text(),cid)
-            elif text.split()[0].split("@")[0].lower() == "/trend" if text else False:
+            elif command == "/trend":
                 send("📈 단기·중기 추세를 계산하고 있습니다.", cid)
                 try:
                     send(trend_report_text(), cid)
                 except Exception as e:
                     print("[Telegram] /trend error", repr(e), flush=True)
                     send(f"⚠️ 추세 조회 오류: {type(e).__name__}: {e}", cid)
-            elif text.split()[0].split("@")[0].lower() == "/version" if text else False:
+            elif command == "/version":
                 send(f"✅ Jaina Coin Monitor v{BOT_VERSION} 실행 중", cid)
-            elif text.split()[0].split("@")[0].lower() == "/booktest" if text else False:
+            elif command == "/booktest":
                 # 먼저 수신 확인을 보내므로, 긴 테스트 전에 명령 수신 여부를 즉시 알 수 있다.
                 send("🧪 /booktest 명령 수신 — 장부 무변경 안전 테스트 시작", cid)
                 try:
@@ -4056,44 +4158,44 @@ def telegram_loop():
                 except Exception as e:
                     print("[Telegram] /booktest error", repr(e), flush=True)
                     send(f"⚠️ 장부 테스트 실패: {type(e).__name__}: {e}",cid)
-            elif text.startswith("/enginetest"):
+            elif command == "/enginetest":
                 run_enginetest(cid)
-            elif text.startswith("/signaltest"):
+            elif command == "/signaltest":
                 run_signaltest(cid)
-            elif text.startswith("/reversaltest"):
+            elif command == "/reversaltest":
                 run_reversaltest(cid)
-            elif text.startswith("/autotest"):
+            elif command == "/autotest":
                 send("🧪 17분 자동보고 기능을 즉시 테스트합니다.", cid)
                 send_summary_once(cid)
-            elif text.startswith("/test"):
+            elif command == "/test":
                 send("🔔 테스트 알림 성공",cid)
-            elif text.startswith("/status"):
+            elif command == "/status":
                 try:
                     d=snapshot()
                     parts=[alert_text(s,d[s]) for s in ("WLD","KAIA") if s in d]
                     send("\n\n".join(parts),cid)
                 except Exception as e:
                     send(f"⚠️ 시세 조회 오류: {e}",cid)
-            elif text.split()[0].split("@")[0].lower() == "/good" if text else False:
+            elif command == "/good":
                 send("🚀 W·K 호재·전망 자료를 넓게 수집하고 있습니다. (정기보고는 3시간마다)",cid)
                 try:
                     send_long(good_radar_text(),cid)
                 except Exception as e:
                     print("[Telegram] /good error", repr(e), flush=True)
                     send(f"⚠️ 호재 레이더 조회 오류: {type(e).__name__}: {e}",cid)
-            elif text.split()[0].split("@")[0].lower() == "/causetest" if text else False:
+            elif command == "/causetest":
                 send(causetest_text(),cid)
-            elif text.split()[0].split("@")[0].lower() == "/cause" if text else False:
+            elif command == "/cause":
                 send("🔎 현재 W·K/BTC 변동과 최신 시장 원인을 우선 분석합니다.",cid)
                 threading.Thread(target=cause_command_worker,args=(cid,),daemon=True).start()
-            elif text.startswith("/news"):
+            elif command == "/news":
                 send("📰 최신 뉴스를 수집하고 있습니다. 잠시만 기다려 주세요.",cid)
                 try:
                     pp=text.split(maxsplit=1); sym=pp[1] if len(pp)>1 else None
                     send_long(news_digest(sym),cid)
                 except Exception as e:
                     send(f"⚠️ 뉴스 조회 오류: {e}",cid)
-            elif text.startswith("/market"):
+            elif command == "/market":
                 send("📊 " + market_brief(),cid)
 
 HTML = '''
